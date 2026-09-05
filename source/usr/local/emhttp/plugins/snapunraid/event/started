@@ -1,0 +1,24 @@
+#!/bin/bash
+#
+# event/started - Unraid plugin event hook.
+#
+# Unraid's plugin manager runs any executable file named after a lifecycle
+# event (e.g. "started") that it finds under a plugin's event/ directory.
+# This one fires after the array/webGUI environment is up, and its only
+# job is to relink our persisted SnapRAID binary from the boot flash back
+# into /usr/local/sbin - cheap, and necessary because the root filesystem
+# is rebuilt from scratch (RAM-based) on every boot.
+#
+# NOTE: the exact event name/timing guarantees of Unraid's plugin event
+# system should be double-checked against your Unraid version - if this
+# hook doesn't fire as expected, calling install_snapraid.sh once from the
+# Setup tab after boot achieves the same result (it's the same fast
+# symlink-relink path when a persisted binary already exists on flash).
+#
+SCRIPT_DIR="/usr/local/emhttp/plugins/snapunraid/scripts"
+
+# The redirect below can't write if this dir doesn't exist yet (install_snapraid.sh
+# creates it via common.sh, but that happens only after the redirect opens).
+mkdir -p /var/local/snapunraid/logs
+
+bash "${SCRIPT_DIR}/install_snapraid.sh" >> /var/local/snapunraid/logs/boot-relink.log 2>&1 &

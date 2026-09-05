@@ -1,0 +1,350 @@
+Menu="Utilities"
+Title="SnapUnraid"
+Icon="camera"
+---
+<?php
+/*
+ * SnapUnraid - friendly front-end for SnapRAID on Unraid
+ * Tabs: Setup / Dashboard / Recover
+ *
+ * NOTE: AJAX/POST handling does NOT live here. Unraid's nginx returns 405
+ * Not Allowed for POST to .page files, so all front-end post() requests go to
+ * /plugins/snapunraid/ajax.php. This file only renders the page HTML.
+ */
+
+$plugin      = 'snapunraid';
+$scriptDir   = '/usr/local/emhttp/plugins/' . $plugin . '/scripts';
+$settingsIni = '/boot/config/plugins/' . $plugin . '/settings.ini';
+// ---------------------------------------------------------------------------
+// Load current settings for pre-filling the Setup form
+// ---------------------------------------------------------------------------
+function sre_ini_get($key, $default = '') {
+    global $settingsIni;
+    if (!file_exists($settingsIni)) return $default;
+    foreach (file($settingsIni) as $line) {
+        if (strpos($line, "{$key}=") === 0) {
+            return trim(substr($line, strlen($key) + 1));
+        }
+    }
+    return $default;
+}
+
+$cur_parity   = sre_ini_get('PARITY_PATH', '');
+$cur_data     = sre_ini_get('DATA_DISKS', '');
+$cur_content  = sre_ini_get('CONTENT_DISKS', '');
+$cur_excludes = sre_ini_get('EXCLUDES', '*.tmp,*.bak,/appdata/,/system/,/domains/,/isos/,downloads/incomplete/');
+$cur_schedule = sre_ini_get('SCHEDULE', 'daily');
+$cur_custom_sync = sre_ini_get('CUSTOM_SYNC_CRON', '30 3 * * 1,3,5');
+$cur_custom_scrub = sre_ini_get('CUSTOM_SCRUB_CRON', '0 4 * * 0');
+$cur_threshold= sre_ini_get('DELETE_THRESHOLD_COUNT', '50');
+$alertDefaults = [
+    'ALERT_SYNC_OK' => '0', 'ALERT_SYNC_ERROR' => '1', 'ALERT_SYNC_CONFIRM' => '1',
+    'ALERT_SCRUB_OK' => '0', 'ALERT_SCRUB_ISSUES' => '1',
+    'ALERT_RECOVER_OK' => '0', 'ALERT_RECOVER_ERROR' => '1', 'ALERT_CANCELLED' => '0',
+    'ALERT_PARITY_STALE' => '1', 'ALERT_DISK_OFFLINE' => '1',
+    'ALERT_PARITY_SPACE' => '1', 'ALERT_SCRUB_OVERDUE' => '1',
+    'ALERT_CONTENT_STALE' => '1', 'ALERT_PARITY_MISSING' => '1', 'ALERT_UNRECOVERED' => '1',
+    'ALERT_PARITY_STALE_DAYS' => '30', 'ALERT_PARITY_SPACE_PCT' => '10', 'ALERT_SCRUB_OVERDUE_DAYS' => '30',
+];
+$cur_alerts = [];
+foreach ($alertDefaults as $k => $def) { $cur_alerts[$k] = sre_ini_get($k, $def); }
+$is_configured = !empty($cur_parity) && !empty($cur_data);
+
+// Auto-detect an existing snapraid.conf (from the old snapraid plugin, a
+// manual /etc install, etc.) so the Setup tab can offer to import it.
+$importCandidates = [
+    '/boot/config/plugins/snapraid/snapraid.conf',
+    '/etc/snapraid.conf',
+    '/boot/config/snapraid.conf',
+];
+$importDetected = '';
+foreach ($importCandidates as $c) { if (file_exists($c)) { $importDetected = $c; break; } }
+?>
+
+<link rel="stylesheet" href="/plugins/<?=$plugin?>/snapunraid.css">
+
+<div class="sre-wrap">
+  <div class="sre-tabs">
+    <button class="sre-tab-btn active" data-tab="dashboard">Dashboard</button>
+    <button class="sre-tab-btn" data-tab="setup">Setup</button>
+    <button class="sre-tab-btn" data-tab="history">History</button>
+    <button class="sre-tab-btn" data-tab="recover" id="sre-recover-tab-btn">Recover</button>
+    <button class="sre-tab-btn" data-tab="alerts">Alerts</button>
+    <button class="sre-tab-btn" data-tab="backup">Backup/Import</button>
+  </div>
+
+  <!-- Help tooltip (Sync vs Scrub explainer). Populated by JS; shown on click. -->
+  <div id="sre-help-tooltip" class="sre-tooltip"></div>
+
+  <!-- ============================ DASHBOARD ============================ -->
+  <div class="sre-tab-panel" id="tab-dashboard">
+    <?php if (!$is_configured): ?>
+      <div class="sre-banner sre-banner-info">
+        Not set up yet. Head to the <b>Setup</b> tab to choose your parity disk and protected disks.
+      </div>
+    <?php else: ?>
+      <div class="sre-status-card">
+        <div class="sre-status-light" id="sre-status-light">&nbsp;</div>
+        <div class="sre-status-text">
+          <div class="sre-status-headline" id="sre-status-headline">Loading status&hellip;</div>
+          <div class="sre-status-sub" id="sre-status-sub"></div>
+          <div class="sre-status-sub" id="sre-array-status"></div>
+        </div>
+      </div>
+      <div id="sre-parity-stale-warning" class="sre-banner sre-banner-warn" style="display:none;"></div>
+
+      <div class="sre-row">
+        <div class="sre-card">
+          <h3 class="sre-h3-help">Sync
+            <span class="sre-help" data-help="sync" title="What is Sync?">&#63;</span>
+          </h3>
+          <p id="sre-sync-detail">&mdash;</p>
+          <button class="sre-btn sre-btn-primary" id="sre-btn-sync">Sync Now</button>
+          <button class="sre-btn sre-btn-warn" id="sre-btn-sync-stop" style="display:none;">Cancel Sync</button>
+          <div id="sre-sync-confirm" class="sre-confirm" style="display:none;">
+            <p></p>
+            <button class="sre-btn" id="sre-btn-sync-show-changes" type="button" style="display:none;">Show files to be removed</button>
+            <button class="sre-btn sre-btn-warn" id="sre-btn-sync-force">Yes, sync anyway</button>
+            <button class="sre-btn" id="sre-btn-sync-cancel">Cancel</button>
+          </div>
+        </div>
+        <div class="sre-card">
+          <h3 class="sre-h3-help">Scrub
+            <span class="sre-help" data-help="scrub" title="What is Scrub?">&#63;</span>
+          </h3>
+          <p id="sre-scrub-detail">&mdash;</p>
+          <button class="sre-btn sre-btn-primary" id="sre-btn-scrub">Scrub Now</button>
+          <button class="sre-btn sre-btn-warn" id="sre-btn-scrub-stop" style="display:none;">Cancel Scrub</button>
+        </div>
+      </div>
+
+      <div class="sre-card">
+        <h3>Recent activity</h3>
+        <div id="sre-log-list" class="sre-log-list">Loading&hellip;</div>
+      </div>
+    <?php endif; ?>
+  </div>
+
+  <!-- ============================== SETUP =============================== -->
+  <div class="sre-tab-panel" id="tab-setup" style="display:none;">
+    <div class="sre-card" id="sre-snapraid-install-card">
+      <h3>SnapRAID binary</h3>
+      <p class="sre-hint" id="sre-install-detail">Checking whether SnapRAID is installed…</p>
+      <button class="sre-btn sre-btn-primary" id="sre-btn-install-snapraid" style="display:none;">Install SnapRAID</button>
+    </div>
+
+    <div id="sre-setup-body" style="display:none;">
+    <div class="sre-card">
+      <h3>1. Parity disk</h3>
+      <p class="sre-hint">Pick a mounted disk (array disk or pool) to hold SnapRAID parity. It must be at least as large as your largest protected disk. Raw/unformatted devices aren't supported by SnapRAID — format the disk and add it as a pool first.</p>
+      <div id="sre-parity-warning" class="sre-banner sre-banner-warn" style="display:none;">Your current parity disk is a raw device, which SnapRAID doesn't support. Format it and add it as a pool, then select it here.</div>
+      <select id="sre-parity-select" class="sre-select"></select>
+    </div>
+
+    <div class="sre-card">
+      <h3>1b. Second parity disk (optional)</h3>
+      <p class="sre-hint">Protects against two simultaneous disk failures. Must be a <b>different</b>, mounted disk at least as large as your largest protected disk. SnapRAID builds the second parity file on the next sync.</p>
+      <select id="sre-parity2-select" class="sre-select"></select>
+    </div>
+
+    <div class="sre-card">
+      <h3>2. Disks to protect</h3>
+      <p class="sre-hint">Check every array disk and pool disk you want covered by parity.</p>
+      <div id="sre-disk-checklist" class="sre-checklist">Loading disks&hellip;</div>
+    </div>
+
+    <div class="sre-card">
+      <h3>3. Skip these (optional)</h3>
+      <p class="sre-hint">Common junk / active-write locations are pre-checked. Add your own, one per line.</p>
+      <div class="sre-checklist" id="sre-exclude-presets">
+        <label><input type="checkbox" value="/appdata/" class="sre-exclude-preset" checked> Docker appdata</label>
+        <label><input type="checkbox" value="/system/" class="sre-exclude-preset" checked> VM disk images (system share)</label>
+        <label><input type="checkbox" value="/domains/" class="sre-exclude-preset" checked> VM domains</label>
+        <label><input type="checkbox" value="/isos/" class="sre-exclude-preset" checked> ISOs</label>
+        <label><input type="checkbox" value="downloads/incomplete/" class="sre-exclude-preset" checked> In-progress downloads</label>
+        <label><input type="checkbox" value="*.tmp" class="sre-exclude-preset" checked> *.tmp files</label>
+      </div>
+      <textarea id="sre-exclude-custom" class="sre-textarea" placeholder="One extra pattern per line, e.g. *.partial"></textarea>
+    </div>
+
+    <div class="sre-card">
+      <h3>4. Schedule</h3>
+      <select id="sre-schedule-select" class="sre-select">
+        <option value="daily">Sync nightly, scrub weekly (recommended)</option>
+        <option value="mwf">Sync Mon/Wed/Fri, scrub Sunday</option>
+        <option value="weekly">Sync + scrub weekly</option>
+        <option value="custom">Custom schedule</option>
+        <option value="manual">Manual only (no automatic schedule)</option>
+      </select>
+      <div id="sre-custom-schedule" style="display:none;">
+        <p class="sre-hint">Pick the days and times for sync and scrub. The daily 3:15am health check always runs.</p>
+
+        <div class="sre-custom-block">
+          <label class="sre-custom-label">Sync</label>
+          <div class="sre-dow-picker" id="sre-sync-dow">
+            <label><input type="checkbox" value="1"> Mon</label>
+            <label><input type="checkbox" value="2"> Tue</label>
+            <label><input type="checkbox" value="3"> Wed</label>
+            <label><input type="checkbox" value="4"> Thu</label>
+            <label><input type="checkbox" value="5"> Fri</label>
+            <label><input type="checkbox" value="6"> Sat</label>
+            <label><input type="checkbox" value="0"> Sun</label>
+          </div>
+          <label class="sre-custom-time">Time <input type="time" id="sre-sync-time" value="03:30"></label>
+          <div class="sre-cron-preview">Cron: <code id="sre-sync-cron-preview"></code></div>
+        </div>
+
+        <div class="sre-custom-block">
+          <label class="sre-custom-label">Scrub</label>
+          <div class="sre-dow-picker" id="sre-scrub-dow">
+            <label><input type="checkbox" value="1"> Mon</label>
+            <label><input type="checkbox" value="2"> Tue</label>
+            <label><input type="checkbox" value="3"> Wed</label>
+            <label><input type="checkbox" value="4"> Thu</label>
+            <label><input type="checkbox" value="5"> Fri</label>
+            <label><input type="checkbox" value="6"> Sat</label>
+            <label><input type="checkbox" value="0"> Sun</label>
+          </div>
+          <label class="sre-custom-time">Time <input type="time" id="sre-scrub-time" value="04:00"></label>
+          <div class="sre-cron-preview">Cron: <code id="sre-scrub-cron-preview"></code></div>
+        </div>
+
+        <label class="sre-custom-advanced"><input type="checkbox" id="sre-custom-advanced"> Advanced: edit cron directly</label>
+        <div id="sre-custom-advanced-box" style="display:none;">
+          <label style="display:block;margin-top:8px;">Sync cron</label>
+          <input type="text" id="sre-custom-sync-cron" class="sre-input" placeholder="30 3 * * 1,3,5">
+          <label style="display:block;margin-top:8px;">Scrub cron</label>
+          <input type="text" id="sre-custom-scrub-cron" class="sre-input" placeholder="0 4 * * 0">
+        </div>
+      </div>
+    </div>
+
+    <div class="sre-card">
+      <h3>5. Safety threshold</h3>
+      <p class="sre-hint">If a sync would remove or change more than this many files at once, pause and ask for confirmation instead of proceeding automatically. Protects against a dropped disk being mistaken for mass deletion. Optional — leave blank to use the default of 50.</p>
+      <input type="number" id="sre-threshold-input" class="sre-input" value="<?=htmlspecialchars($cur_threshold)?>" min="1">
+    </div>
+
+    <button class="sre-btn sre-btn-primary" id="sre-btn-save-setup">Save Setup</button>
+    <span id="sre-setup-result"></span>
+    </div> <!-- /sre-setup-body -->
+  </div>
+
+  <!-- ============================ BACKUP/IMPORT ========================== -->
+  <div class="sre-tab-panel" id="tab-backup" style="display:none;">
+    <div class="sre-card">
+      <h3>Config backup</h3>
+      <p class="sre-hint">Snapshot your <code>snapraid.conf</code> and <code>settings.ini</code> to the flash drive. Restoring overwrites the current config with the saved copy.</p>
+      <button class="sre-btn" id="sre-btn-backup-now">Backup now</button>
+      <span id="sre-backup-result"></span>
+      <div id="sre-backup-list" class="sre-backup-list">Loading&hellip;</div>
+    </div>
+
+    <div class="sre-card">
+      <h3>Import existing config</h3>
+      <p class="sre-hint">Already have a <code>snapraid.conf</code> (e.g. from the old snapraid plugin or a manual install)? Import it to pre-fill Setup. Detected: <b id="sre-import-detected"><?= $importDetected ? htmlspecialchars($importDetected) : 'none' ?></b></p>
+      <input type="text" id="sre-import-path" class="sre-input" placeholder="/boot/config/plugins/snapraid/snapraid.conf" value="<?= htmlspecialchars($importDetected) ?>">
+      <div style="margin-top:8px;">
+        <button class="sre-btn" id="sre-btn-import">Import</button>
+        <span id="sre-import-result"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================= RECOVER =============================== -->
+  <div class="sre-tab-panel" id="tab-recover" style="display:none;">
+    <div class="sre-card">
+      <h3>Files needing attention</h3>
+      <p class="sre-hint">Files with checksum mismatches found by the last scrub or full check. Restore a single file, a whole disk, or everything from parity.</p>
+      <div id="sre-check-progress" class="sre-banner sre-banner-info" style="display:none;"></div>
+      <div id="sre-problem-summary" style="display:none; font-size:13px; opacity:.8; margin-bottom:8px;"></div>
+      <div id="sre-problem-list">Checking&hellip;</div>
+      <div style="margin-top:12px; display:flex; gap:8px;">
+        <button class="sre-btn" id="sre-btn-run-check">Run full check</button>
+        <button class="sre-btn sre-btn-warn" id="sre-btn-cancel-check" style="display:none;">Cancel check</button>
+        <button class="sre-btn sre-btn-warn" id="sre-btn-fix-all" style="display:none;">Restore all from parity</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================= HISTORY ============================== -->
+  <div class="sre-tab-panel" id="tab-history" style="display:none;">
+    <div class="sre-card">
+      <h3>Run history
+        <span class="sre-help" data-help="history" title="About History">&#63;</span>
+      </h3>
+      <p class="sre-hint">Past Sync and Scrub runs, newest first. Click a row to view that run's full log. Last 100 runs are kept.</p>
+      <div id="sre-history-list">Loading&hellip;</div>
+    </div>
+  </div>
+
+  <!-- ============================= ALERTS =============================== -->
+  <div class="sre-tab-panel" id="tab-alerts" style="display:none;">
+    <div class="sre-card">
+      <h3>Run notifications</h3>
+      <p class="sre-hint">Choose which events send an Unraid notification. Delivery (email / agent / bell) is still controlled by Unraid's own notification settings.</p>
+      <div class="sre-checklist" id="sre-alert-toggles">
+        <label><input type="checkbox" data-alert="ALERT_SYNC_OK"> Sync completed successfully</label>
+        <label><input type="checkbox" data-alert="ALERT_SYNC_ERROR"> Sync failed or was aborted</label>
+        <label><input type="checkbox" data-alert="ALERT_SYNC_CONFIRM"> Sync paused for confirmation</label>
+        <label><input type="checkbox" data-alert="ALERT_SCRUB_OK"> Scrub / full check completed with no problems</label>
+        <label><input type="checkbox" data-alert="ALERT_SCRUB_ISSUES"> Scrub / full check found problems or failed</label>
+        <label><input type="checkbox" data-alert="ALERT_RECOVER_OK"> Recovery completed</label>
+        <label><input type="checkbox" data-alert="ALERT_RECOVER_ERROR"> Recovery failed or unrecoverable</label>
+        <label><input type="checkbox" data-alert="ALERT_CANCELLED"> Operations cancelled by you</label>
+      </div>
+    </div>
+
+    <div class="sre-card">
+      <h3>Health alerts</h3>
+      <p class="sre-hint">Proactive checks that run daily (and whenever the Dashboard refreshes). Each fires at most once per day while the condition persists.</p>
+      <div id="sre-health-toggles">
+        <div class="sre-alert-row">
+          <label><input type="checkbox" data-alert="ALERT_PARITY_STALE"> Parity is stale</label>
+          <span class="sre-disk-size">older than <input type="number" class="sre-input sre-alert-num" data-alert="ALERT_PARITY_STALE_DAYS" min="1" max="365"> days</span>
+        </div>
+        <div class="sre-alert-row">
+          <label><input type="checkbox" data-alert="ALERT_DISK_OFFLINE"> A configured disk is offline</label>
+        </div>
+        <div class="sre-alert-row">
+          <label><input type="checkbox" data-alert="ALERT_PARITY_SPACE"> Parity disk low on space</label>
+          <span class="sre-disk-size">below <input type="number" class="sre-input sre-alert-num" data-alert="ALERT_PARITY_SPACE_PCT" min="1" max="100">% free</span>
+        </div>
+        <div class="sre-alert-row">
+          <label><input type="checkbox" data-alert="ALERT_SCRUB_OVERDUE"> Scrub is overdue</label>
+          <span class="sre-disk-size">oldest file older than <input type="number" class="sre-input sre-alert-num" data-alert="ALERT_SCRUB_OVERDUE_DAYS" min="1" max="365"> days</span>
+        </div>
+        <div class="sre-alert-row">
+          <label><input type="checkbox" data-alert="ALERT_CONTENT_STALE"> A content file is missing or stale</label>
+        </div>
+        <div class="sre-alert-row">
+          <label><input type="checkbox" data-alert="ALERT_PARITY_MISSING"> The parity file is missing</label>
+        </div>
+        <div class="sre-alert-row">
+          <label><input type="checkbox" data-alert="ALERT_UNRECOVERED"> Damaged files are still unrecovered</label>
+        </div>
+      </div>
+    </div>
+
+    <button class="sre-btn sre-btn-primary" id="sre-btn-save-alerts">Save Alerts</button>
+    <button class="sre-btn" id="sre-btn-test-notify">Send test notification</button>
+    <span id="sre-alerts-result"></span>
+  </div>
+</div>
+
+<script>
+const SRE_AJAX = "/plugins/<?=$plugin?>/ajax.php";
+const SRE_CSRF = <?= json_encode($var['csrf_token'] ?? '') ?>;
+const SRE_PRESELECTED_DATA = <?= json_encode(array_filter(explode(',', $cur_data))) ?>;
+const SRE_PRESELECTED_PARITY = <?= json_encode($cur_parity) ?>;
+const SRE_PRESELECTED_PARITY2 = <?= json_encode(sre_ini_get('PARITY2_PATH', '')) ?>;
+const SRE_PRESELECTED_SCHEDULE = <?= json_encode($cur_schedule) ?>;
+const SRE_CUSTOM_SYNC_CRON = <?= json_encode($cur_custom_sync) ?>;
+const SRE_CUSTOM_SCRUB_CRON = <?= json_encode($cur_custom_scrub) ?>;
+const SRE_ALERTS = <?= json_encode($cur_alerts) ?>;
+const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
+    array_filter(explode(',', $cur_excludes)),
+    ['/appdata/', '/system/', '/domains/', '/isos/', 'downloads/incomplete/', '*.tmp']
+))) ?>;
+</script>
+<script src="/plugins/<?=$plugin?>/snapunraid.js"></script>
