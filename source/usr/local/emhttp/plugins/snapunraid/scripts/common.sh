@@ -6,6 +6,16 @@
 #
 
 PLUGIN_NAME="snapunraid"
+
+# crond runs jobs with a minimal PATH (/bin:/sbin:/usr/bin:/usr/sbin) that does
+# not include /usr/local/sbin, where the snapraid binary is relinked. Without
+# this, every cron-driven sync/scrub/check aborts with "snapraid binary not
+# found" before doing anything. Harmless if the caller already has it.
+case ":${PATH}:" in
+    *:/usr/local/sbin:*) ;;
+    *) export PATH="/usr/local/sbin:/usr/local/bin:${PATH}" ;;
+esac
+
 PLUGIN_HOME="/boot/config/plugins/${PLUGIN_NAME}"
 PLUGIN_VAR="/var/local/${PLUGIN_NAME}"        # runtime state (not persisted across reboot, rebuilt on start)
 # Paths can be overridden via env (SRE_*) for testing without touching the
