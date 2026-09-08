@@ -52,7 +52,7 @@ case "$SCHEDULE" in
         # so proactive alerts (parity stale, disk offline, ...) still fire.
         cat > "$CRON_FILE" <<EOF
 # Managed by SnapUnraid - do not edit by hand, use the plugin's Setup tab.
-15 3 * * * root bash ${SCRIPT_DIR}/alerts.sh check >/dev/null 2>&1
+15 3 * * * bash ${SCRIPT_DIR}/alerts.sh check >/dev/null 2>&1
 EOF
         /etc/rc.d/rc.cron reload >/dev/null 2>&1 || true
         echo "Manual schedule selected - sync/scrub cron removed, health check kept."
@@ -66,9 +66,9 @@ esac
 
 cat > "$CRON_FILE" <<EOF
 # Managed by SnapUnraid - do not edit by hand, use the plugin's Setup tab.
-15 3 * * * root bash ${SCRIPT_DIR}/alerts.sh check >/dev/null 2>&1
-${SYNC_CRON} root bash ${SCRIPT_DIR}/sync.sh >/dev/null 2>&1
-${SCRUB_CRON} root bash ${SCRIPT_DIR}/scrub.sh >/dev/null 2>&1
+15 3 * * * bash ${SCRIPT_DIR}/alerts.sh check >/dev/null 2>&1
+${SYNC_CRON} bash ${SCRIPT_DIR}/sync.sh >/dev/null 2>&1
+${SCRUB_CRON} bash ${SCRIPT_DIR}/scrub.sh >/dev/null 2>&1
 EOF
 
 # Unraid watches /etc/cron.d and reloads automatically, but nudge it just in case
