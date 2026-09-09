@@ -234,6 +234,11 @@ switch ($action) {
         echo shell_exec("bash {$scriptDir}/backup.sh restore {$name}");
         break;
 
+    case 'delete_backup':
+        $name = escapeshellarg($_POST['name'] ?? '');
+        echo shell_exec("bash {$scriptDir}/backup.sh delete {$name}");
+        break;
+
     case 'run_check':
         // Full array check (errors only), in the background so the UI doesn't
         // block; poll get_check_state for progress and results.

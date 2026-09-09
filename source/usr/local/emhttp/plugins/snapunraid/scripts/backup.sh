@@ -6,6 +6,7 @@
 #   backup.sh backup            -> create a timestamped tarball of snapraid.conf + settings.ini
 #   backup.sh list              -> JSON array of {name, date, size}, newest first
 #   backup.sh restore <name>    -> restore a backup (overwrites current config)
+#   backup.sh delete <name>     -> permanently delete a backup tarball
 #
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
@@ -73,8 +74,27 @@ case "${1:-}" in
         fi
         rm -rf "$TMP"
         ;;
+    delete)
+        NAME="${2:-}"
+        # Only allow plain backup filenames - never a path (no traversal).
+        if [[ ! "$NAME" =~ ^[A-Za-z0-9._-]+\.tar\.gz$ ]]; then
+            echo '{"ok":false,"error":"invalid backup name"}'
+            exit 1
+        fi
+        FILE="$BACKUP_DIR/$NAME"
+        if [[ ! -f "$FILE" ]]; then
+            echo '{"ok":false,"error":"backup not found"}'
+            exit 1
+        fi
+        if rm -f "$FILE"; then
+            echo '{"ok":true}'
+        else
+            echo '{"ok":false,"error":"delete failed"}'
+            exit 1
+        fi
+        ;;
     *)
-        echo "Usage: backup.sh {backup|list|restore <name>}" >&2
+        echo "Usage: backup.sh {backup|list|restore <name>|delete <name>}" >&2
         exit 1
         ;;
 esac

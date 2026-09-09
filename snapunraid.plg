@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "snapunraid">
   <!ENTITY author    "jwaspi">
-  <!ENTITY version   "2026.09.09">
+  <!ENTITY version   "2026.09.09-2">
   <!ENTITY launch    "Settings/snapunraid">
   <!ENTITY pluginURL "https://raw.githubusercontent.com/jwaspi/snapunraid/main/snapunraid.plg">
   <!ENTITY support   "https://github.com/jwaspi/snapunraid/issues">
@@ -10,6 +10,7 @@
 <PLUGIN name="snapunraid" version="&version;" author="&author;" icon="camera"
         pluginURL="&pluginURL;" support="&support;" launch="&launch;">
   <CHANGES><![CDATA[
+2026.09.09-2 - Config Backups: added a Delete button next to Restore so old backups can be removed manually (same filename validation and path-traversal protection as Restore).
 2026.09.09 - Setup tab: a disk selected as parity (or second parity) is now hidden from the "disks to protect" checklist instead of remaining selectable, so a disk can no longer be assigned to both roles.
 2026.09.08 - FIX: the cron entries included a "root" user column, but Unraid crond parses /etc/cron.d files in the plain 5-field format and executed "root bash ..." as a command - every scheduled sync/scrub/health-check silently failed with exit 127 since install. Entries are now 5-field like Unraid own cron files.
 2026.09.06 - FIX: cron-driven runs (nightly sync, Sunday scrub, 3:15am health check) aborted instantly with "snapraid binary not found" because crond's minimal PATH does not include /usr/local/sbin, where the snapraid binary lives; common.sh now adds it to PATH.
@@ -1247,6 +1248,7 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
                 return `<div class="sre-backup-item">
                     <span>${esc(b.name)} <span style="opacity:.6">(${humanBytes(b.size)}, ${dt.toLocaleString()})</span></span>
                     <button class="sre-btn sre-btn-warn sre-restore-backup" data-name="${esc(b.name)}">Restore</button>
+                    <button class="sre-btn sre-delete-backup" data-name="${esc(b.name)}">Delete</button>
                  </div>`;
             }).join('');
             Array.from(list.querySelectorAll('.sre-restore-backup')).forEach(btn => {
@@ -1256,6 +1258,17 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
                     post('restore_config', { name: btn.dataset.name }).then(res => {
                         const resultEl = document.getElementById('sre-backup-result');
                         resultEl.textContent = res.ok ? 'Restored.' : ('Error: ' + (res.error || 'unknown'));
+                        loadBackups();
+                    });
+                });
+            });
+            Array.from(list.querySelectorAll('.sre-delete-backup')).forEach(btn => {
+                btn.addEventListener('click', () => {
+                    if (!confirm('Delete this backup permanently? This cannot be undone.')) return;
+                    btn.textContent = 'Deleting…';
+                    post('delete_backup', { name: btn.dataset.name }).then(res => {
+                        const resultEl = document.getElementById('sre-backup-result');
+                        resultEl.textContent = res.ok ? 'Backup deleted.' : ('Error: ' + (res.error || 'unknown'));
                         loadBackups();
                     });
                 });
@@ -1625,6 +1638,11 @@ switch ($action) {
     case 'restore_config':
         $name = escapeshellarg($_POST['name'] ?? '');
         echo shell_exec("bash {$scriptDir}/backup.sh restore {$name}");
+        break;
+
+    case 'delete_backup':
+        $name = escapeshellarg($_POST['name'] ?? '');
+        echo shell_exec("bash {$scriptDir}/backup.sh delete {$name}");
         break;
 
     case 'run_check':
@@ -2979,6 +2997,7 @@ esac
 #   backup.sh backup            -> create a timestamped tarball of snapraid.conf + settings.ini
 #   backup.sh list              -> JSON array of {name, date, size}, newest first
 #   backup.sh restore <name>    -> restore a backup (overwrites current config)
+#   backup.sh delete <name>     -> permanently delete a backup tarball
 #
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
@@ -3046,8 +3065,27 @@ case "${1:-}" in
         fi
         rm -rf "$TMP"
         ;;
+    delete)
+        NAME="${2:-}"
+        # Only allow plain backup filenames - never a path (no traversal).
+        if [[ ! "$NAME" =~ ^[A-Za-z0-9._-]+\.tar\.gz$ ]]; then
+            echo '{"ok":false,"error":"invalid backup name"}'
+            exit 1
+        fi
+        FILE="$BACKUP_DIR/$NAME"
+        if [[ ! -f "$FILE" ]]; then
+            echo '{"ok":false,"error":"backup not found"}'
+            exit 1
+        fi
+        if rm -f "$FILE"; then
+            echo '{"ok":true}'
+        else
+            echo '{"ok":false,"error":"delete failed"}'
+            exit 1
+        fi
+        ;;
     *)
-        echo "Usage: backup.sh {backup|list|restore <name>}" >&2
+        echo "Usage: backup.sh {backup|list|restore <name>|delete <name>}" >&2
         exit 1
         ;;
 esac

@@ -700,6 +700,7 @@
                 return `<div class="sre-backup-item">
                     <span>${esc(b.name)} <span style="opacity:.6">(${humanBytes(b.size)}, ${dt.toLocaleString()})</span></span>
                     <button class="sre-btn sre-btn-warn sre-restore-backup" data-name="${esc(b.name)}">Restore</button>
+                    <button class="sre-btn sre-delete-backup" data-name="${esc(b.name)}">Delete</button>
                  </div>`;
             }).join('');
             Array.from(list.querySelectorAll('.sre-restore-backup')).forEach(btn => {
@@ -709,6 +710,17 @@
                     post('restore_config', { name: btn.dataset.name }).then(res => {
                         const resultEl = document.getElementById('sre-backup-result');
                         resultEl.textContent = res.ok ? 'Restored.' : ('Error: ' + (res.error || 'unknown'));
+                        loadBackups();
+                    });
+                });
+            });
+            Array.from(list.querySelectorAll('.sre-delete-backup')).forEach(btn => {
+                btn.addEventListener('click', () => {
+                    if (!confirm('Delete this backup permanently? This cannot be undone.')) return;
+                    btn.textContent = 'Deleting…';
+                    post('delete_backup', { name: btn.dataset.name }).then(res => {
+                        const resultEl = document.getElementById('sre-backup-result');
+                        resultEl.textContent = res.ok ? 'Backup deleted.' : ('Error: ' + (res.error || 'unknown'));
                         loadBackups();
                     });
                 });
