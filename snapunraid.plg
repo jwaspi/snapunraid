@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "snapunraid">
   <!ENTITY author    "jwaspi">
-  <!ENTITY version   "2026.09.08">
+  <!ENTITY version   "2026.09.09">
   <!ENTITY launch    "Settings/snapunraid">
   <!ENTITY pluginURL "https://raw.githubusercontent.com/jwaspi/snapunraid/main/snapunraid.plg">
   <!ENTITY support   "https://github.com/jwaspi/snapunraid/issues">
@@ -10,6 +10,7 @@
 <PLUGIN name="snapunraid" version="&version;" author="&author;" icon="camera"
         pluginURL="&pluginURL;" support="&support;" launch="&launch;">
   <CHANGES><![CDATA[
+2026.09.09 - Setup tab: a disk selected as parity (or second parity) is now hidden from the "disks to protect" checklist instead of remaining selectable, so a disk can no longer be assigned to both roles.
 2026.09.08 - FIX: the cron entries included a "root" user column, but Unraid crond parses /etc/cron.d files in the plain 5-field format and executed "root bash ..." as a command - every scheduled sync/scrub/health-check silently failed with exit 127 since install. Entries are now 5-field like Unraid own cron files.
 2026.09.06 - FIX: cron-driven runs (nightly sync, Sunday scrub, 3:15am health check) aborted instantly with "snapraid binary not found" because crond's minimal PATH does not include /usr/local/sbin, where the snapraid binary lives; common.sh now adds it to PATH.
 2026.09.05 - initial public release. SnapRAID webGUI for Unraid: Setup (parity + optional second parity, data disks, excludes, schedule, safety threshold), Dashboard with live sync/scrub progress, Recover (per-file/disk/all restore + full check), History, Alerts, and config Backup/Import.
@@ -911,6 +912,7 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
             const paritySel = document.getElementById('sre-parity-select');
             const parity2Sel = document.getElementById('sre-parity2-select');
             const checklist = document.getElementById('sre-disk-checklist');
+            const dataLabels = {};   // rel -> checklist <label>, for parity-availability syncing
             paritySel.innerHTML = '<option value="">-- choose a disk --</option>';
             if (parity2Sel) parity2Sel.innerHTML = '<option value="">None (single parity)</option>';
             checklist.innerHTML = '';
@@ -951,19 +953,32 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
                 const checked = SRE_PRESELECTED_DATA.includes(d.rel) ? 'checked' : '';
                 label.innerHTML = `<input type="checkbox" class="sre-data-disk" value="${d.rel}" ${checked}> ${d.name} (${d.type})` + ` <span class="sre-disk-size">${humanBytes(d.used_bytes)} used / ${humanBytes(d.size_bytes)}</span>`;
                 checklist.appendChild(label);
+                dataLabels[d.rel] = label;
             });
 
-            // Keep the second-parity selector from offering the same disk as
-            // the first (SnapRAID rejects parity and parity-2 on one device).
-            function syncParity2Options() {
-                if (!parity2Sel) return;
+            // A disk chosen as parity (or parity-2) can't also be protected -
+            // SnapRAID forbids it. Hide it from the checklist and drop any
+            // stale checkmark so a save can't silently double-use the disk.
+            function syncDiskAvailability() {
                 const p1 = paritySel.value;
-                Array.from(parity2Sel.options).forEach(o => {
-                    o.disabled = o.value !== '' && o.value === p1;
+                const p2 = parity2Sel ? parity2Sel.value : '';
+                Object.keys(dataLabels).forEach(rel => {
+                    const taken = rel !== '' && (rel === p1 || rel === p2);
+                    dataLabels[rel].style.display = taken ? 'none' : '';
+                    if (taken) dataLabels[rel].querySelector('input').checked = false;
                 });
+                // Keep the second-parity selector from offering the same disk
+                // as the first (SnapRAID rejects parity and parity-2 on one
+                // device).
+                if (parity2Sel) {
+                    Array.from(parity2Sel.options).forEach(o => {
+                        o.disabled = o.value !== '' && o.value === p1;
+                    });
+                }
             }
-            paritySel.addEventListener('change', syncParity2Options);
-            syncParity2Options();
+            paritySel.addEventListener('change', syncDiskAvailability);
+            if (parity2Sel) parity2Sel.addEventListener('change', syncDiskAvailability);
+            syncDiskAvailability();
 
             // If the saved parity path is a raw device, warn the user - it's
             // no longer selectable and SnapRAID can't use it.

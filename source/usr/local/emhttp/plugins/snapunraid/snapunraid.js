@@ -365,6 +365,7 @@
             const paritySel = document.getElementById('sre-parity-select');
             const parity2Sel = document.getElementById('sre-parity2-select');
             const checklist = document.getElementById('sre-disk-checklist');
+            const dataLabels = {};   // rel -> checklist <label>, for parity-availability syncing
             paritySel.innerHTML = '<option value="">-- choose a disk --</option>';
             if (parity2Sel) parity2Sel.innerHTML = '<option value="">None (single parity)</option>';
             checklist.innerHTML = '';
@@ -405,19 +406,32 @@
                 const checked = SRE_PRESELECTED_DATA.includes(d.rel) ? 'checked' : '';
                 label.innerHTML = `<input type="checkbox" class="sre-data-disk" value="${d.rel}" ${checked}> ${d.name} (${d.type})` + ` <span class="sre-disk-size">${humanBytes(d.used_bytes)} used / ${humanBytes(d.size_bytes)}</span>`;
                 checklist.appendChild(label);
+                dataLabels[d.rel] = label;
             });
 
-            // Keep the second-parity selector from offering the same disk as
-            // the first (SnapRAID rejects parity and parity-2 on one device).
-            function syncParity2Options() {
-                if (!parity2Sel) return;
+            // A disk chosen as parity (or parity-2) can't also be protected -
+            // SnapRAID forbids it. Hide it from the checklist and drop any
+            // stale checkmark so a save can't silently double-use the disk.
+            function syncDiskAvailability() {
                 const p1 = paritySel.value;
-                Array.from(parity2Sel.options).forEach(o => {
-                    o.disabled = o.value !== '' && o.value === p1;
+                const p2 = parity2Sel ? parity2Sel.value : '';
+                Object.keys(dataLabels).forEach(rel => {
+                    const taken = rel !== '' && (rel === p1 || rel === p2);
+                    dataLabels[rel].style.display = taken ? 'none' : '';
+                    if (taken) dataLabels[rel].querySelector('input').checked = false;
                 });
+                // Keep the second-parity selector from offering the same disk
+                // as the first (SnapRAID rejects parity and parity-2 on one
+                // device).
+                if (parity2Sel) {
+                    Array.from(parity2Sel.options).forEach(o => {
+                        o.disabled = o.value !== '' && o.value === p1;
+                    });
+                }
             }
-            paritySel.addEventListener('change', syncParity2Options);
-            syncParity2Options();
+            paritySel.addEventListener('change', syncDiskAvailability);
+            if (parity2Sel) parity2Sel.addEventListener('change', syncDiskAvailability);
+            syncDiskAvailability();
 
             // If the saved parity path is a raw device, warn the user - it's
             // no longer selectable and SnapRAID can't use it.
