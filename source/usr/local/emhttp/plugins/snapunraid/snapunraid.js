@@ -699,8 +699,10 @@
                 const dt = new Date(b.date * 1000);
                 return `<div class="sre-backup-item">
                     <span>${esc(b.name)} <span style="opacity:.6">(${humanBytes(b.size)}, ${dt.toLocaleString()})</span></span>
-                    <button class="sre-btn sre-btn-warn sre-restore-backup" data-name="${esc(b.name)}">Restore</button>
-                    <button class="sre-btn sre-delete-backup" data-name="${esc(b.name)}">Delete</button>
+                    <span class="sre-backup-actions">
+                        <button class="sre-btn sre-btn-warn sre-restore-backup" data-name="${esc(b.name)}">Restore</button>
+                        <button class="sre-btn sre-delete-backup" data-name="${esc(b.name)}">Delete</button>
+                    </span>
                  </div>`;
             }).join('');
             Array.from(list.querySelectorAll('.sre-restore-backup')).forEach(btn => {

@@ -157,4 +157,5 @@
     display: flex; justify-content: space-between; align-items: center;
     padding: 8px 0; border-bottom: 1px solid rgba(128,128,128,0.15);
 }
+.sre-backup-actions { display: flex; gap: 6px; align-items: center; }
 #sre-backup-result { margin-left: 10px; font-size: 13px; }

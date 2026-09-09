@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "snapunraid">
   <!ENTITY author    "jwaspi">
-  <!ENTITY version   "2026.09.09-2">
+  <!ENTITY version   "2026.09.09a">
   <!ENTITY launch    "Settings/snapunraid">
   <!ENTITY pluginURL "https://raw.githubusercontent.com/jwaspi/snapunraid/main/snapunraid.plg">
   <!ENTITY support   "https://github.com/jwaspi/snapunraid/issues">
@@ -10,7 +10,7 @@
 <PLUGIN name="snapunraid" version="&version;" author="&author;" icon="camera"
         pluginURL="&pluginURL;" support="&support;" launch="&launch;">
   <CHANGES><![CDATA[
-2026.09.09-2 - Config Backups: added a Delete button next to Restore so old backups can be removed manually (same filename validation and path-traversal protection as Restore).
+2026.09.09a - Config Backups: added a Delete button next to Restore so old backups can be removed manually (same filename validation and path-traversal protection as Restore).
 2026.09.09 - Setup tab: a disk selected as parity (or second parity) is now hidden from the "disks to protect" checklist instead of remaining selectable, so a disk can no longer be assigned to both roles.
 2026.09.08 - FIX: the cron entries included a "root" user column, but Unraid crond parses /etc/cron.d files in the plain 5-field format and executed "root bash ..." as a command - every scheduled sync/scrub/health-check silently failed with exit 127 since install. Entries are now 5-field like Unraid own cron files.
 2026.09.06 - FIX: cron-driven runs (nightly sync, Sunday scrub, 3:15am health check) aborted instantly with "snapraid binary not found" because crond's minimal PATH does not include /usr/local/sbin, where the snapraid binary lives; common.sh now adds it to PATH.
@@ -539,6 +539,7 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
     display: flex; justify-content: space-between; align-items: center;
     padding: 8px 0; border-bottom: 1px solid rgba(128,128,128,0.15);
 }
+.sre-backup-actions { display: flex; gap: 6px; align-items: center; }
 #sre-backup-result { margin-left: 10px; font-size: 13px; }
 ]]>
   </INLINE>
@@ -1247,8 +1248,10 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
                 const dt = new Date(b.date * 1000);
                 return `<div class="sre-backup-item">
                     <span>${esc(b.name)} <span style="opacity:.6">(${humanBytes(b.size)}, ${dt.toLocaleString()})</span></span>
-                    <button class="sre-btn sre-btn-warn sre-restore-backup" data-name="${esc(b.name)}">Restore</button>
-                    <button class="sre-btn sre-delete-backup" data-name="${esc(b.name)}">Delete</button>
+                    <span class="sre-backup-actions">
+                        <button class="sre-btn sre-btn-warn sre-restore-backup" data-name="${esc(b.name)}">Restore</button>
+                        <button class="sre-btn sre-delete-backup" data-name="${esc(b.name)}">Delete</button>
+                    </span>
                  </div>`;
             }).join('');
             Array.from(list.querySelectorAll('.sre-restore-backup')).forEach(btn => {
