@@ -59,6 +59,9 @@ OLDER_THAN=$(sre_get_setting "SCRUB_OLDER_THAN" "10")
 
 echo "Running snapraid scrub -p ${PERCENT} -o ${OLDER_THAN} ..." >> "$LOGFILE"
 sre_write_state "scrub_progress" ""
+# Give any in-flight snapraid command (e.g. a Dashboard status-refresh that
+# started just before this scrub) time to release its content lock first.
+sre_wait_snapraid 120
 # --gui (undocumented in 14.9; there is NO short -g) + --log ">>$LOGFILE"
 # makes snapraid emit machine-readable run:pos: progress tags into the same
 # log; we poll them and publish a live percentage.

@@ -426,3 +426,25 @@ sre_lock() {
     exec 200>"$LOCK_FILE"
     flock -n 200 || { echo "Another SnapUnraid operation is already running."; exit 1; }
 }
+
+# Wait for any in-flight snapraid command to release its content lock.
+# snapraid takes an exclusive lock for EVERY command, so a Dashboard
+# status-refresh (`snapraid status`, kicked off by a page load) that is still
+# running when a sync/scrub starts makes that sync/scrub fail instantly with
+# "SnapRAID is already in use!". The status-refresh side already skips itself
+# while a sync/scrub is running; this covers the reverse window. Polls until
+# no snapraid process and no status-refresh is alive, up to $1 seconds
+# (default 120). Returns non-zero if still busy after the timeout - callers
+# proceed anyway, since the snapraid lock error will then surface normally.
+sre_wait_snapraid() {
+    local timeout_s="${1:-120}" waited=0
+    while (( waited < timeout_s )); do
+        if ! pgrep -x snapraid >/dev/null 2>&1 \
+           && ! pgrep -f 'status.sh status-refresh' >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    return 1
+}

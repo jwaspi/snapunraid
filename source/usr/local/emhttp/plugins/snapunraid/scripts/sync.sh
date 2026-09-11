@@ -197,6 +197,9 @@ fi
 # 3) Dry-run diff to evaluate the size of the change before committing
 #    `snapraid diff` exit codes: 0 = no changes, 2 = changes found, other = error
 # ---------------------------------------------------------------------------
+# Give any in-flight snapraid command (e.g. a Dashboard status-refresh that
+# started just before this sync) time to release its content lock first.
+sre_wait_snapraid 120
 DIFF_OUT=$(snapraid --conf "$SNAPRAID_CONF" diff 2>&1)
 DIFF_RC=$?
 echo "$DIFF_OUT" >> "$LOGFILE"

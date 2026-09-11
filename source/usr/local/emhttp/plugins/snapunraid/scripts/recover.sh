@@ -86,6 +86,9 @@ case "$ACTION" in
         }
         echo "Running snapraid -e check ..." >> "$LOGFILE"
         sre_write_state "check_progress" ""
+        # Give any in-flight snapraid command (e.g. a Dashboard status-refresh
+        # that started just before this check) time to release its lock first.
+        sre_wait_snapraid 120
         # -e = errors only (faster than a full check); --gui (undocumented in
         # 14.9, there is NO short -g) + --log emits run:pos: progress tags we
         # poll for a live percentage.

@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "snapunraid">
   <!ENTITY author    "jwaspi">
-  <!ENTITY version   "2026.09.09a">
+  <!ENTITY version   "2026.09.11">
   <!ENTITY launch    "Settings/snapunraid">
   <!ENTITY pluginURL "https://raw.githubusercontent.com/jwaspi/snapunraid/main/snapunraid.plg">
   <!ENTITY support   "https://github.com/jwaspi/snapunraid/issues">
@@ -10,6 +10,7 @@
 <PLUGIN name="snapunraid" version="&version;" author="&author;" icon="camera"
         pluginURL="&pluginURL;" support="&support;" launch="&launch;">
   <CHANGES><![CDATA[
+2026.09.11 - FIX: a sync or scrub started right after opening the plugin page could abort instantly with "SnapRAID is already in use!" because the Dashboard's background status-refresh still held snapraid's exclusive content lock; sync/scrub/check now wait up to 2 minutes for any in-flight snapraid command to release the lock before starting.
 2026.09.09a - Config Backups: added a Delete button next to Restore so old backups can be removed manually (same filename validation and path-traversal protection as Restore).
 2026.09.09 - Setup tab: a disk selected as parity (or second parity) is now hidden from the "disks to protect" checklist instead of remaining selectable, so a disk can no longer be assigned to both roles.
 2026.09.08 - FIX: the cron entries included a "root" user column, but Unraid crond parses /etc/cron.d files in the plain 5-field format and executed "root bash ..." as a command - every scheduled sync/scrub/health-check silently failed with exit 127 since install. Entries are now 5-field like Unraid own cron files.
@@ -2326,6 +2327,28 @@ sre_lock() {
     exec 200>"$LOCK_FILE"
     flock -n 200 || { echo "Another SnapUnraid operation is already running."; exit 1; }
 }
+
+# Wait for any in-flight snapraid command to release its content lock.
+# snapraid takes an exclusive lock for EVERY command, so a Dashboard
+# status-refresh (`snapraid status`, kicked off by a page load) that is still
+# running when a sync/scrub starts makes that sync/scrub fail instantly with
+# "SnapRAID is already in use!". The status-refresh side already skips itself
+# while a sync/scrub is running; this covers the reverse window. Polls until
+# no snapraid process and no status-refresh is alive, up to $1 seconds
+# (default 120). Returns non-zero if still busy after the timeout - callers
+# proceed anyway, since the snapraid lock error will then surface normally.
+sre_wait_snapraid() {
+    local timeout_s="${1:-120}" waited=0
+    while (( waited < timeout_s )); do
+        if ! pgrep -x snapraid >/dev/null 2>&1 \
+           && ! pgrep -f 'status.sh status-refresh' >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    return 1
+}
 ]]>
   </INLINE>
   </FILE>
@@ -2895,6 +2918,9 @@ case "$ACTION" in
         }
         echo "Running snapraid -e check ..." >> "$LOGFILE"
         sre_write_state "check_progress" ""
+        # Give any in-flight snapraid command (e.g. a Dashboard status-refresh
+        # that started just before this check) time to release its lock first.
+        sre_wait_snapraid 120
         # -e = errors only (faster than a full check); --gui (undocumented in
         # 14.9, there is NO short -g) + --log emits run:pos: progress tags we
         # poll for a live percentage.
@@ -3159,6 +3185,9 @@ OLDER_THAN=$(sre_get_setting "SCRUB_OLDER_THAN" "10")
 
 echo "Running snapraid scrub -p ${PERCENT} -o ${OLDER_THAN} ..." >> "$LOGFILE"
 sre_write_state "scrub_progress" ""
+# Give any in-flight snapraid command (e.g. a Dashboard status-refresh that
+# started just before this scrub) time to release its content lock first.
+sre_wait_snapraid 120
 # --gui (undocumented in 14.9; there is NO short -g) + --log ">>$LOGFILE"
 # makes snapraid emit machine-readable run:pos: progress tags into the same
 # log; we poll them and publish a live percentage.
@@ -3604,6 +3633,9 @@ fi
 # 3) Dry-run diff to evaluate the size of the change before committing
 #    `snapraid diff` exit codes: 0 = no changes, 2 = changes found, other = error
 # ---------------------------------------------------------------------------
+# Give any in-flight snapraid command (e.g. a Dashboard status-refresh that
+# started just before this sync) time to release its content lock first.
+sre_wait_snapraid 120
 DIFF_OUT=$(snapraid --conf "$SNAPRAID_CONF" diff 2>&1)
 DIFF_RC=$?
 echo "$DIFF_OUT" >> "$LOGFILE"
