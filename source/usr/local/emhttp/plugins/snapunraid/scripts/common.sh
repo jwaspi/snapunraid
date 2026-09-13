@@ -356,6 +356,14 @@ sre_duration() {
     fi
 }
 
+sre_log_missing_count() {
+    # Count errors in a scrub/check log that are "Open error. No such file or
+    # directory." - blocks of files that were deleted or renamed since the last
+    # sync. Expected after legitimate changes, NOT corruption; the remedy is a
+    # sync, not a restore (restoring would resurrect the deleted files).
+    grep -cE '^error:[0-9]+:[a-zA-Z0-9]+:[^:]*: Open error\. No such file or directory\.' "$1" 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # Alerts - toggleable Unraid notifications (see the Alerts tab).
 # ---------------------------------------------------------------------------

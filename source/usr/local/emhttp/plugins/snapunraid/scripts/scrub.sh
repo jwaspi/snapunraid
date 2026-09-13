@@ -90,14 +90,28 @@ sre_prune_logs
 
 if [[ $SCRUB_RC -eq 0 && $ERRORS -eq 0 ]]; then
     sre_write_state "scrub_status" "ok" "scrub_finished" "$(date +%s)" \
-        "scrub_last_bad_files" "0" "scrub_last_log" "$LOGFILE" "scrub_last_error" "" "scrub_pid" "" "scrub_progress" ""
+        "scrub_last_bad_files" "0" "scrub_last_log" "$LOGFILE" "scrub_last_error" "" "scrub_pid" "" "scrub_progress" "" \
+        "scrub_missing_files" "0"
     sre_append_history "scrub" "ok" "bad_files" "0" "log" "$LOGFILE"
     sre_notify "Scrub completed" "${SUMMARY}${DURATION:+, took ${DURATION}}." "normal"
 else
+    # "Open error. No such file or directory." errors are files deleted or
+    # renamed since the last sync - expected after legitimate changes, not
+    # corruption. If that is ALL the scrub found, point at a sync instead of
+    # the Recover tab's restore flow, which would resurrect deleted files.
+    MISSING=$(sre_log_missing_count "$LOGFILE")
+    MISSING=${MISSING:-0}
     sre_write_state "scrub_status" "issues_found" "scrub_finished" "$(date +%s)" \
-        "scrub_last_bad_files" "$ERRORS" "scrub_last_log" "$LOGFILE" "scrub_pid" "" "scrub_progress" ""
+        "scrub_last_bad_files" "$ERRORS" "scrub_last_log" "$LOGFILE" "scrub_pid" "" "scrub_progress" "" \
+        "scrub_missing_files" "$MISSING"
     sre_append_history "scrub" "issues" "bad_files" "$ERRORS" "log" "$LOGFILE"
-    sre_notify "Scrub found problems" "${SUMMARY}${DURATION:+, took ${DURATION}}. Open the Recover tab in SnapUnraid." "alert"
+    if [[ $MISSING -gt 0 && $MISSING -eq $ERRORS ]]; then
+        MSG="All ${ERRORS} scrub errors are from files deleted or renamed since the last sync - not corruption. Run a sync to update parity and clear them."
+        sre_append_history "scrub" "issues" "message" "$MSG" "log" "$LOGFILE"
+        sre_notify "Scrub: files deleted since last sync" "${MSG}${DURATION:+ (took ${DURATION})}" "warning"
+    else
+        sre_notify "Scrub found problems" "${SUMMARY}${DURATION:+, took ${DURATION}}. Open the Recover tab in SnapUnraid." "alert"
+    fi
 fi
 
 exit $SCRUB_RC

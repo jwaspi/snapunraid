@@ -757,19 +757,48 @@
                 fixAllBtn.style.display = 'none';
                 return;
             }
-            fixAllBtn.style.display = 'inline-block';
-            const totalSize = problems.reduce((s, p) => s + (p.size || 0), 0);
-            const unrecoverable = problems.filter(p => p.reason === 'unrecoverable').length;
+            // Files whose scrub errors were "Open error. No such file or
+            // directory." were deleted or renamed since the last sync - that
+            // is not damage, and restoring would undo the deletion. A sync
+            // clears them from parity.
+            const real = problems.filter(p => p.reason !== 'missing');
+            const missing = problems.filter(p => p.reason === 'missing');
+            if (real.length === 0) {
+                // Nothing actually damaged: explain, and hide every restore
+                // control so deleted files can't be brought back by accident.
+                if (summaryEl) {
+                    summaryEl.style.display = 'block';
+                    summaryEl.textContent = `All ${missing.length} listed file(s) were deleted or renamed since the last sync - this is not damage. Run a Sync to clear them from parity; restoring would bring them back.`;
+                }
+                fixAllBtn.style.display = 'none';
+                list.innerHTML = missing.map(p =>
+                    `<div class="sre-problem-item">
+                        <span>${esc(p.path)} <span style="opacity:.6">(${esc(p.disk)}, deleted since last sync)</span></span>
+                        <span style="opacity:.7;font-size:12px;white-space:nowrap">no restore needed</span>
+                     </div>`
+                ).join('');
+                return;
+            }
+            fixAllBtn.style.display = missing.length ? 'none' : 'inline-block';
+            const totalSize = real.reduce((s, p) => s + (p.size || 0), 0);
+            const unrecoverable = real.filter(p => p.reason === 'unrecoverable').length;
             if (summaryEl) {
                 summaryEl.style.display = 'block';
-                summaryEl.textContent = `${problems.length} damaged file(s)${unrecoverable ? `, ${unrecoverable} unrecoverable` : ''} - ~${humanBytes(totalSize)} to restore.`;
+                summaryEl.textContent = `${real.length} damaged file(s)${unrecoverable ? `, ${unrecoverable} unrecoverable` : ''} - ~${humanBytes(totalSize)} to restore.` +
+                    (missing.length ? ` Another ${missing.length} file(s) were deleted or renamed since the last sync - not damage; run a Sync to clear them.` : '');
             }
-            list.innerHTML = problems.map(p =>
-                `<div class="sre-problem-item">
+            list.innerHTML = [...real, ...missing].map(p => {
+                if (p.reason === 'missing') {
+                    return `<div class="sre-problem-item">
+                        <span>${esc(p.path)} <span style="opacity:.6">(${esc(p.disk)}, deleted since last sync)</span></span>
+                        <span style="opacity:.7;font-size:12px;white-space:nowrap">no restore needed</span>
+                     </div>`;
+                }
+                return `<div class="sre-problem-item">
                     <span>${esc(p.path)} <span style="opacity:.6">(${esc(p.disk)}${p.reason === 'unrecoverable' ? ', unrecoverable' : ''})</span></span>
                     <button class="sre-btn sre-btn-warn sre-fix-file" data-path="${esc(p.path)}">Restore this file</button>
-                 </div>`
-            ).join('');
+                 </div>`;
+            }).join('');
             document.querySelectorAll('.sre-fix-file').forEach(btn => {
                 btn.addEventListener('click', () => {
                     btn.textContent = 'Restoring\u2026';

@@ -30,39 +30,37 @@ case "$ACTION" in
         # plus a human-readable line: Data error in file '/mnt/...' at position ...
         # The tag paths are relative to the disk mount, so we rebuild the full
         # path as /mnt/<disk>/<sub>. Pure bash + jq (python3 not guaranteed).
+        #
+        # Deduplication is done with awk+sort, NOT per-line jq: a scrub with
+        # 100k+ error blocks (e.g. every block of deleted files) would spawn a
+        # jq process per line and take minutes. One jq call builds the JSON.
         state=$(sre_read_state_json)
         log=$(jq -r '.check_last_log // .scrub_last_log // .sync_last_log // ""' <<<"$state" 2>/dev/null)
-        problems="[]"
         if [[ -n "$log" && -f "$log" ]]; then
-            while IFS= read -r line; do
-                path=""; disk=""; reason=""
-                if [[ "$line" =~ ^(error_data|error):[0-9]+:([^:]+):([^:]+): ]]; then
-                    disk="${BASH_REMATCH[2]}"
-                    path="/mnt/${disk}/${BASH_REMATCH[3]#/}"
-                    reason="checksum mismatch"
-                elif [[ "$line" =~ ^status:(recoverable|unrecoverable):([^:]+):([^:]+)$ ]]; then
-                    disk="${BASH_REMATCH[2]}"
-                    path="/mnt/${disk}/${BASH_REMATCH[3]#/}"
-                    reason="unrecoverable"
-                    [[ "${BASH_REMATCH[1]}" == "recoverable" ]] && reason="recoverable"
-                elif [[ "$line" == *"Data error in file '"* ]]; then
-                    path=$(sed -n "s/.*in file '\([^']*\)'.*/\1/p" <<<"$line")
-                    disk=$(awk -F/ '{print $3}' <<<"$path")
-                    reason="checksum mismatch"
-                else
-                    continue
-                fi
-                [[ -z "$path" ]] && continue
-                # dedupe by path
-                if ! jq -e --arg p "$path" 'any(.[]; .path == $p)' <<<"$problems" >/dev/null 2>&1; then
-                    size=0
-                    [[ -f "$path" ]] && size=$(stat -c %s "$path" 2>/dev/null || echo 0)
-                    problems=$(jq -c --arg d "$disk" --arg p "$path" --arg r "$reason" --argjson s "${size:-0}" \
-                        '. + [{disk:$d,path:$p,reason:$r,size:$s}]' <<<"$problems")
-                fi
-            done < "$log"
+            # Extract unique (disk, path, reason) triples from the machine
+            # tags. "Open error. No such file or directory." marks a file that
+            # was deleted or renamed since the last sync - not damage;
+            # restoring it would undo the deletion, the remedy is a sync.
+            awk -F':' '
+                ($1 == "error" || $1 == "error_data") && $2 ~ /^[0-9]+$/ {
+                    r = "checksum mismatch"
+                    if ($0 ~ /Open error\. No such file or directory\./) r = "missing"
+                    print $3 "\t" $4 "\t" r
+                }
+                $1 == "status" && ($2 == "recoverable" || $2 == "unrecoverable") {
+                    print $3 "\t" $4 "\t" $2
+                }
+            ' "$log" | sort -u | while IFS=$'\t' read -r disk sub reason; do
+                [[ -z "$disk" || -z "$sub" ]] && continue
+                path="/mnt/${disk}/${sub#/}"
+                size=0
+                [[ -f "$path" ]] && size=$(stat -c %s "$path" 2>/dev/null || echo 0)
+                printf '%s\t%s\t%s\t%s\n' "$disk" "$path" "$reason" "$size"
+            done | jq -R -c 'split("\t") | {disk: .[0], path: .[1], reason: .[2], size: (.[3] | tonumber)}' \
+                | jq -c -s 'if length == 0 then [] else . end'
+        else
+            echo "[]"
         fi
-        echo "$problems"
         ;;
     check)
         # Full array check (errors only). Runs in the background (setsid) so

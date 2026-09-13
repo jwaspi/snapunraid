@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "snapunraid">
   <!ENTITY author    "jwaspi">
-  <!ENTITY version   "2026.09.11">
+  <!ENTITY version   "2026.09.13">
   <!ENTITY launch    "Settings/snapunraid">
   <!ENTITY pluginURL "https://raw.githubusercontent.com/jwaspi/snapunraid/main/snapunraid.plg">
   <!ENTITY support   "https://github.com/jwaspi/snapunraid/issues">
@@ -10,6 +10,7 @@
 <PLUGIN name="snapunraid" version="&version;" author="&author;" icon="camera"
         pluginURL="&pluginURL;" support="&support;" launch="&launch;">
   <CHANGES><![CDATA[
+2026.09.13 - Recover tab: scrub errors for files deleted since the last sync ("Open error - No such file or directory") are now labeled as such and are no longer offered for restore - restoring would bring the deleted files back. If ALL scrub errors are of this kind the notification and Recover tab now say to run a sync instead, and "Restore all" is hidden. Also fixes the Recover tab hanging for minutes when a scrub logs 100k+ errors (the per-line jq dedupe was replaced with a single awk/sort pass).
 2026.09.11 - FIX: a sync or scrub started right after opening the plugin page could abort instantly with "SnapRAID is already in use!" because the Dashboard's background status-refresh still held snapraid's exclusive content lock; sync/scrub/check now wait up to 2 minutes for any in-flight snapraid command to release the lock before starting.
 2026.09.09a - Config Backups: added a Delete button next to Restore so old backups can be removed manually (same filename validation and path-traversal protection as Restore).
 2026.09.09 - Setup tab: a disk selected as parity (or second parity) is now hidden from the "disks to protect" checklist instead of remaining selectable, so a disk can no longer be assigned to both roles.
@@ -1307,19 +1308,48 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
                 fixAllBtn.style.display = 'none';
                 return;
             }
-            fixAllBtn.style.display = 'inline-block';
-            const totalSize = problems.reduce((s, p) => s + (p.size || 0), 0);
-            const unrecoverable = problems.filter(p => p.reason === 'unrecoverable').length;
+            // Files whose scrub errors were "Open error. No such file or
+            // directory." were deleted or renamed since the last sync - that
+            // is not damage, and restoring would undo the deletion. A sync
+            // clears them from parity.
+            const real = problems.filter(p => p.reason !== 'missing');
+            const missing = problems.filter(p => p.reason === 'missing');
+            if (real.length === 0) {
+                // Nothing actually damaged: explain, and hide every restore
+                // control so deleted files can't be brought back by accident.
+                if (summaryEl) {
+                    summaryEl.style.display = 'block';
+                    summaryEl.textContent = `All ${missing.length} listed file(s) were deleted or renamed since the last sync - this is not damage. Run a Sync to clear them from parity; restoring would bring them back.`;
+                }
+                fixAllBtn.style.display = 'none';
+                list.innerHTML = missing.map(p =>
+                    `<div class="sre-problem-item">
+                        <span>${esc(p.path)} <span style="opacity:.6">(${esc(p.disk)}, deleted since last sync)</span></span>
+                        <span style="opacity:.7;font-size:12px;white-space:nowrap">no restore needed</span>
+                     </div>`
+                ).join('');
+                return;
+            }
+            fixAllBtn.style.display = missing.length ? 'none' : 'inline-block';
+            const totalSize = real.reduce((s, p) => s + (p.size || 0), 0);
+            const unrecoverable = real.filter(p => p.reason === 'unrecoverable').length;
             if (summaryEl) {
                 summaryEl.style.display = 'block';
-                summaryEl.textContent = `${problems.length} damaged file(s)${unrecoverable ? `, ${unrecoverable} unrecoverable` : ''} - ~${humanBytes(totalSize)} to restore.`;
+                summaryEl.textContent = `${real.length} damaged file(s)${unrecoverable ? `, ${unrecoverable} unrecoverable` : ''} - ~${humanBytes(totalSize)} to restore.` +
+                    (missing.length ? ` Another ${missing.length} file(s) were deleted or renamed since the last sync - not damage; run a Sync to clear them.` : '');
             }
-            list.innerHTML = problems.map(p =>
-                `<div class="sre-problem-item">
+            list.innerHTML = [...real, ...missing].map(p => {
+                if (p.reason === 'missing') {
+                    return `<div class="sre-problem-item">
+                        <span>${esc(p.path)} <span style="opacity:.6">(${esc(p.disk)}, deleted since last sync)</span></span>
+                        <span style="opacity:.7;font-size:12px;white-space:nowrap">no restore needed</span>
+                     </div>`;
+                }
+                return `<div class="sre-problem-item">
                     <span>${esc(p.path)} <span style="opacity:.6">(${esc(p.disk)}${p.reason === 'unrecoverable' ? ', unrecoverable' : ''})</span></span>
                     <button class="sre-btn sre-btn-warn sre-fix-file" data-path="${esc(p.path)}">Restore this file</button>
-                 </div>`
-            ).join('');
+                 </div>`;
+            }).join('');
             document.querySelectorAll('.sre-fix-file').forEach(btn => {
                 btn.addEventListener('click', () => {
                     btn.textContent = 'Restoring\u2026';
@@ -2257,6 +2287,14 @@ sre_duration() {
     fi
 }
 
+sre_log_missing_count() {
+    # Count errors in a scrub/check log that are "Open error. No such file or
+    # directory." - blocks of files that were deleted or renamed since the last
+    # sync. Expected after legitimate changes, NOT corruption; the remedy is a
+    # sync, not a restore (restoring would resurrect the deleted files).
+    grep -cE '^error:[0-9]+:[a-zA-Z0-9]+:[^:]*: Open error\. No such file or directory\.' "$1" 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # Alerts - toggleable Unraid notifications (see the Alerts tab).
 # ---------------------------------------------------------------------------
@@ -2862,39 +2900,37 @@ case "$ACTION" in
         # plus a human-readable line: Data error in file '/mnt/...' at position ...
         # The tag paths are relative to the disk mount, so we rebuild the full
         # path as /mnt/<disk>/<sub>. Pure bash + jq (python3 not guaranteed).
+        #
+        # Deduplication is done with awk+sort, NOT per-line jq: a scrub with
+        # 100k+ error blocks (e.g. every block of deleted files) would spawn a
+        # jq process per line and take minutes. One jq call builds the JSON.
         state=$(sre_read_state_json)
         log=$(jq -r '.check_last_log // .scrub_last_log // .sync_last_log // ""' <<<"$state" 2>/dev/null)
-        problems="[]"
         if [[ -n "$log" && -f "$log" ]]; then
-            while IFS= read -r line; do
-                path=""; disk=""; reason=""
-                if [[ "$line" =~ ^(error_data|error):[0-9]+:([^:]+):([^:]+): ]]; then
-                    disk="${BASH_REMATCH[2]}"
-                    path="/mnt/${disk}/${BASH_REMATCH[3]#/}"
-                    reason="checksum mismatch"
-                elif [[ "$line" =~ ^status:(recoverable|unrecoverable):([^:]+):([^:]+)$ ]]; then
-                    disk="${BASH_REMATCH[2]}"
-                    path="/mnt/${disk}/${BASH_REMATCH[3]#/}"
-                    reason="unrecoverable"
-                    [[ "${BASH_REMATCH[1]}" == "recoverable" ]] && reason="recoverable"
-                elif [[ "$line" == *"Data error in file '"* ]]; then
-                    path=$(sed -n "s/.*in file '\([^']*\)'.*/\1/p" <<<"$line")
-                    disk=$(awk -F/ '{print $3}' <<<"$path")
-                    reason="checksum mismatch"
-                else
-                    continue
-                fi
-                [[ -z "$path" ]] && continue
-                # dedupe by path
-                if ! jq -e --arg p "$path" 'any(.[]; .path == $p)' <<<"$problems" >/dev/null 2>&1; then
-                    size=0
-                    [[ -f "$path" ]] && size=$(stat -c %s "$path" 2>/dev/null || echo 0)
-                    problems=$(jq -c --arg d "$disk" --arg p "$path" --arg r "$reason" --argjson s "${size:-0}" \
-                        '. + [{disk:$d,path:$p,reason:$r,size:$s}]' <<<"$problems")
-                fi
-            done < "$log"
+            # Extract unique (disk, path, reason) triples from the machine
+            # tags. "Open error. No such file or directory." marks a file that
+            # was deleted or renamed since the last sync - not damage;
+            # restoring it would undo the deletion, the remedy is a sync.
+            awk -F':' '
+                ($1 == "error" || $1 == "error_data") && $2 ~ /^[0-9]+$/ {
+                    r = "checksum mismatch"
+                    if ($0 ~ /Open error\. No such file or directory\./) r = "missing"
+                    print $3 "\t" $4 "\t" r
+                }
+                $1 == "status" && ($2 == "recoverable" || $2 == "unrecoverable") {
+                    print $3 "\t" $4 "\t" $2
+                }
+            ' "$log" | sort -u | while IFS=$'\t' read -r disk sub reason; do
+                [[ -z "$disk" || -z "$sub" ]] && continue
+                path="/mnt/${disk}/${sub#/}"
+                size=0
+                [[ -f "$path" ]] && size=$(stat -c %s "$path" 2>/dev/null || echo 0)
+                printf '%s\t%s\t%s\t%s\n' "$disk" "$path" "$reason" "$size"
+            done | jq -R -c 'split("\t") | {disk: .[0], path: .[1], reason: .[2], size: (.[3] | tonumber)}' \
+                | jq -c -s 'if length == 0 then [] else . end'
+        else
+            echo "[]"
         fi
-        echo "$problems"
         ;;
     check)
         # Full array check (errors only). Runs in the background (setsid) so
@@ -3216,14 +3252,28 @@ sre_prune_logs
 
 if [[ $SCRUB_RC -eq 0 && $ERRORS -eq 0 ]]; then
     sre_write_state "scrub_status" "ok" "scrub_finished" "$(date +%s)" \
-        "scrub_last_bad_files" "0" "scrub_last_log" "$LOGFILE" "scrub_last_error" "" "scrub_pid" "" "scrub_progress" ""
+        "scrub_last_bad_files" "0" "scrub_last_log" "$LOGFILE" "scrub_last_error" "" "scrub_pid" "" "scrub_progress" "" \
+        "scrub_missing_files" "0"
     sre_append_history "scrub" "ok" "bad_files" "0" "log" "$LOGFILE"
     sre_notify "Scrub completed" "${SUMMARY}${DURATION:+, took ${DURATION}}." "normal"
 else
+    # "Open error. No such file or directory." errors are files deleted or
+    # renamed since the last sync - expected after legitimate changes, not
+    # corruption. If that is ALL the scrub found, point at a sync instead of
+    # the Recover tab's restore flow, which would resurrect deleted files.
+    MISSING=$(sre_log_missing_count "$LOGFILE")
+    MISSING=${MISSING:-0}
     sre_write_state "scrub_status" "issues_found" "scrub_finished" "$(date +%s)" \
-        "scrub_last_bad_files" "$ERRORS" "scrub_last_log" "$LOGFILE" "scrub_pid" "" "scrub_progress" ""
+        "scrub_last_bad_files" "$ERRORS" "scrub_last_log" "$LOGFILE" "scrub_pid" "" "scrub_progress" "" \
+        "scrub_missing_files" "$MISSING"
     sre_append_history "scrub" "issues" "bad_files" "$ERRORS" "log" "$LOGFILE"
-    sre_notify "Scrub found problems" "${SUMMARY}${DURATION:+, took ${DURATION}}. Open the Recover tab in SnapUnraid." "alert"
+    if [[ $MISSING -gt 0 && $MISSING -eq $ERRORS ]]; then
+        MSG="All ${ERRORS} scrub errors are from files deleted or renamed since the last sync - not corruption. Run a sync to update parity and clear them."
+        sre_append_history "scrub" "issues" "message" "$MSG" "log" "$LOGFILE"
+        sre_notify "Scrub: files deleted since last sync" "${MSG}${DURATION:+ (took ${DURATION})}" "warning"
+    else
+        sre_notify "Scrub found problems" "${SUMMARY}${DURATION:+, took ${DURATION}}. Open the Recover tab in SnapUnraid." "alert"
+    fi
 fi
 
 exit $SCRUB_RC
