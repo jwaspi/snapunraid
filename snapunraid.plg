@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "snapunraid">
   <!ENTITY author    "jwaspi">
-  <!ENTITY version   "2026.09.13">
+  <!ENTITY version   "2026.09.14">
   <!ENTITY launch    "Settings/snapunraid">
   <!ENTITY pluginURL "https://raw.githubusercontent.com/jwaspi/snapunraid/main/snapunraid.plg">
   <!ENTITY support   "https://github.com/jwaspi/snapunraid/issues">
@@ -10,6 +10,7 @@
 <PLUGIN name="snapunraid" version="&version;" author="&author;" icon="camera"
         pluginURL="&pluginURL;" support="&support;" launch="&launch;">
   <CHANGES><![CDATA[
+2026.09.14 - Dashboard: a scrub that only flagged files deleted since the last sync now shows a warning "Sync needed" instead of the red "Attention needed", and a successful sync automatically clears that status so the Dashboard returns to "Protected" without waiting for the next scrub. Real corruption still shows "Attention needed".
 2026.09.13 - Recover tab: scrub errors for files deleted since the last sync ("Open error - No such file or directory") are now labeled as such and are no longer offered for restore - restoring would bring the deleted files back. If ALL scrub errors are of this kind the notification and Recover tab now say to run a sync instead, and "Restore all" is hidden. Also fixes the Recover tab hanging for minutes when a scrub logs 100k+ errors (the per-line jq dedupe was replaced with a single awk/sort pass).
 2026.09.11 - FIX: a sync or scrub started right after opening the plugin page could abort instantly with "SnapRAID is already in use!" because the Dashboard's background status-refresh still held snapraid's exclusive content lock; sync/scrub/check now wait up to 2 minutes for any in-flight snapraid command to release the lock before starting.
 2026.09.09a - Config Backups: added a Delete button next to Restore so old backups can be removed manually (same filename validation and path-traversal protection as Restore).
@@ -607,11 +608,19 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
             const sub = document.getElementById('sre-status-sub');
             if (!light) return; // not configured yet, dashboard shows setup banner instead
 
+            // A scrub that only flagged "deleted since last sync" files is not
+            // damage - the remedy is a sync, so show a warning "Sync needed"
+            // rather than the error "Attention needed".
+            const scrubMissing = Number(state.scrub_missing_files || 0);
+            const scrubOnlyMissing = state.scrub_status === 'issues_found' && scrubMissing > 0
+                && scrubMissing >= Number(state.scrub_last_bad_files || 0);
             let cls = 'ok', text = 'Protected';
-            if (state.sync_status === 'error' || state.scrub_status === 'issues_found') {
+            if (state.sync_status === 'error' || (state.scrub_status === 'issues_found' && !scrubOnlyMissing)) {
                 cls = 'error'; text = 'Attention needed';
             } else if (state.sync_status === 'needs_confirmation' || state.sync_status === 'running' || state.scrub_status === 'running') {
                 cls = 'warn'; text = 'In progress / needs review';
+            } else if (scrubOnlyMissing) {
+                cls = 'warn'; text = 'Sync needed';
             } else if (state.sync_status === 'cancelled' || state.scrub_status === 'cancelled') {
                 cls = 'warn'; text = 'Cancelled';
             }
@@ -3764,6 +3773,18 @@ if [[ $SYNC_RC -eq 0 ]]; then
         "sync_last_log" "$LOGFILE" "sync_last_error" "" "sync_pid" "" "sync_progress" ""
     sre_append_history "sync" "ok" "added" "$ADDED" "removed" "$REMOVED" "updated" "$UPDATED" "log" "$LOGFILE"
     sre_notify "Sync completed" "${SUMMARY}${DURATION:+, took ${DURATION}}." "normal"
+    # A scrub that ONLY reported "file deleted since last sync" blocks is fully
+    # resolved by this sync (its issues were unsynced deletions, now synced).
+    # Clear the stale issues status so the Dashboard returns to "Protected"
+    # instead of staying on "Attention needed" until the next scrub. Real
+    # corruption (any non-missing error) is left untouched for re-scrubbing.
+    SCRUB_RESOLVED=$(jq -r 'if .scrub_status == "issues_found" \
+        and ((.scrub_missing_files // 0 | tonumber) > 0) \
+        and ((.scrub_missing_files // 0 | tonumber) == (.scrub_last_bad_files // 0 | tonumber)) \
+        then 1 else 0 end' "$STATE_FILE" 2>/dev/null)
+    if [[ "$SCRUB_RESOLVED" == "1" ]]; then
+        sre_write_state "scrub_status" "ok" "scrub_last_bad_files" "0" "scrub_missing_files" "0"
+    fi
 else
     sre_write_state "sync_status" "error" "sync_finished" "$(date +%s)" "sync_last_log" "$LOGFILE" \
         "sync_last_error" "snapraid sync exited with code ${SYNC_RC}, see log" "sync_pid" "" "sync_progress" ""

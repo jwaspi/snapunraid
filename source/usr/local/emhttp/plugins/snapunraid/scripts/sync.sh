@@ -278,6 +278,18 @@ if [[ $SYNC_RC -eq 0 ]]; then
         "sync_last_log" "$LOGFILE" "sync_last_error" "" "sync_pid" "" "sync_progress" ""
     sre_append_history "sync" "ok" "added" "$ADDED" "removed" "$REMOVED" "updated" "$UPDATED" "log" "$LOGFILE"
     sre_notify "Sync completed" "${SUMMARY}${DURATION:+, took ${DURATION}}." "normal"
+    # A scrub that ONLY reported "file deleted since last sync" blocks is fully
+    # resolved by this sync (its issues were unsynced deletions, now synced).
+    # Clear the stale issues status so the Dashboard returns to "Protected"
+    # instead of staying on "Attention needed" until the next scrub. Real
+    # corruption (any non-missing error) is left untouched for re-scrubbing.
+    SCRUB_RESOLVED=$(jq -r 'if .scrub_status == "issues_found" \
+        and ((.scrub_missing_files // 0 | tonumber) > 0) \
+        and ((.scrub_missing_files // 0 | tonumber) == (.scrub_last_bad_files // 0 | tonumber)) \
+        then 1 else 0 end' "$STATE_FILE" 2>/dev/null)
+    if [[ "$SCRUB_RESOLVED" == "1" ]]; then
+        sre_write_state "scrub_status" "ok" "scrub_last_bad_files" "0" "scrub_missing_files" "0"
+    fi
 else
     sre_write_state "sync_status" "error" "sync_finished" "$(date +%s)" "sync_last_log" "$LOGFILE" \
         "sync_last_error" "snapraid sync exited with code ${SYNC_RC}, see log" "sync_pid" "" "sync_progress" ""

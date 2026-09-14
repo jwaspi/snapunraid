@@ -56,11 +56,19 @@
             const sub = document.getElementById('sre-status-sub');
             if (!light) return; // not configured yet, dashboard shows setup banner instead
 
+            // A scrub that only flagged "deleted since last sync" files is not
+            // damage - the remedy is a sync, so show a warning "Sync needed"
+            // rather than the error "Attention needed".
+            const scrubMissing = Number(state.scrub_missing_files || 0);
+            const scrubOnlyMissing = state.scrub_status === 'issues_found' && scrubMissing > 0
+                && scrubMissing >= Number(state.scrub_last_bad_files || 0);
             let cls = 'ok', text = 'Protected';
-            if (state.sync_status === 'error' || state.scrub_status === 'issues_found') {
+            if (state.sync_status === 'error' || (state.scrub_status === 'issues_found' && !scrubOnlyMissing)) {
                 cls = 'error'; text = 'Attention needed';
             } else if (state.sync_status === 'needs_confirmation' || state.sync_status === 'running' || state.scrub_status === 'running') {
                 cls = 'warn'; text = 'In progress / needs review';
+            } else if (scrubOnlyMissing) {
+                cls = 'warn'; text = 'Sync needed';
             } else if (state.sync_status === 'cancelled' || state.scrub_status === 'cancelled') {
                 cls = 'warn'; text = 'Cancelled';
             }
