@@ -4,16 +4,23 @@
 #
 # Unraid's plugin manager runs any executable file named after a lifecycle
 # event (e.g. "started") that it finds under a plugin's event/ directory.
-# This one fires after the array/webGUI environment is up, and its only
-# job is to relink our persisted SnapRAID binary from the boot flash back
-# into /usr/local/sbin - cheap, and necessary because the root filesystem
-# is rebuilt from scratch (RAM-based) on every boot.
+# This one fires after the array/webGUI environment is up, and its job is to
+# rebuild the two runtime artifacts that live outside the persisted flash
+# config, both of which are wiped because the root filesystem is rebuilt from
+# scratch (RAM-based) on every boot:
+#
+#   1. relink the persisted SnapRAID binary from the boot flash back into
+#      /usr/local/sbin (install_snapraid.sh);
+#   2. rewrite /etc/cron.d/snapunraid from settings.ini so the sync/scrub/
+#      health-check schedule survives the reboot (install_cron.sh).
 #
 # NOTE: the exact event name/timing guarantees of Unraid's plugin event
 # system should be double-checked against your Unraid version - if this
-# hook doesn't fire as expected, calling install_snapraid.sh once from the
-# Setup tab after boot achieves the same result (it's the same fast
-# symlink-relink path when a persisted binary already exists on flash).
+# hook doesn't fire as expected, calling install_snapraid.sh and
+# install_cron.sh once from the Setup tab after boot achieves the same
+# result (install_snapraid.sh is the fast symlink-relink path when a
+# persisted binary already exists on flash; saving Setup runs
+# install_cron.sh).
 #
 SCRIPT_DIR="/usr/local/emhttp/plugins/snapunraid/scripts"
 
@@ -22,3 +29,8 @@ SCRIPT_DIR="/usr/local/emhttp/plugins/snapunraid/scripts"
 mkdir -p /var/local/snapunraid/logs
 
 bash "${SCRIPT_DIR}/install_snapraid.sh" >> /var/local/snapunraid/logs/boot-relink.log 2>&1 &
+
+# Reinstall the cron schedule at boot. Without this the schedule is only ever
+# written when Set up is saved, so a reboot would silently leave the array
+# unprotected until someone revisited the plugin page.
+bash "${SCRIPT_DIR}/install_cron.sh" >> /var/local/snapunraid/logs/boot-cron.log 2>&1 &

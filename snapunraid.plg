@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "snapunraid">
   <!ENTITY author    "jwaspi">
-  <!ENTITY version   "2026.09.14">
+  <!ENTITY version   "2026.09.26">
   <!ENTITY launch    "Settings/snapunraid">
   <!ENTITY pluginURL "https://raw.githubusercontent.com/jwaspi/snapunraid/main/snapunraid.plg">
   <!ENTITY support   "https://github.com/jwaspi/snapunraid/issues">
@@ -10,6 +10,7 @@
 <PLUGIN name="snapunraid" version="&version;" author="&author;" icon="camera"
         pluginURL="&pluginURL;" support="&support;" launch="&launch;">
   <CHANGES><![CDATA[
+2026.09.26 - FIX: the sync/scrub/health-check schedule did not survive a reboot. /etc/cron.d/snapunraid lives on the RAM rootfs and was only ever written when Setup was saved, so after every reboot no cron entries existed until someone reopened the plugin - the array silently ran unprotected. The event/started hook now reinstalls the schedule from settings.ini at boot. It is also shipped executable via a FILE Mode="0755" attribute, because the plugin's old top-level <RUN command="chmod ..."> never executed (Unraid's installer only processes <FILE> elements) and Unraid's emhttp_event dispatcher only runs hooks with the +x bit - so the hook had never run at all. The ignored <EVENT> tag was removed and the dead <RUN> housekeeping moved into an executable inline post-install FILE block.
 2026.09.14 - Dashboard: a scrub that only flagged files deleted since the last sync now shows a warning "Sync needed" instead of the red "Attention needed", and a successful sync automatically clears that status so the Dashboard returns to "Protected" without waiting for the next scrub. Real corruption still shows "Attention needed".
 2026.09.13 - Recover tab: scrub errors for files deleted since the last sync ("Open error - No such file or directory") are now labeled as such and are no longer offered for restore - restoring would bring the deleted files back. If ALL scrub errors are of this kind the notification and Recover tab now say to run a sync instead, and "Restore all" is hidden. Also fixes the Recover tab hanging for minutes when a scrub logs 100k+ errors (the per-line jq dedupe was replaced with a single awk/sort pass).
 2026.09.11 - FIX: a sync or scrub started right after opening the plugin page could abort instantly with "SnapRAID is already in use!" because the Dashboard's background status-refresh still held snapraid's exclusive content lock; sync/scrub/check now wait up to 2 minutes for any in-flight snapraid command to release the lock before starting.
@@ -21,9 +22,21 @@
   ]]>
   </CHANGES>
 
-  <RUN command="rm -rf /usr/local/emhttp/plugins/snapunraid"/>
-  <RUN command="mkdir -p /usr/local/emhttp/plugins/snapunraid/scripts"/>
-  <RUN command="mkdir -p /usr/local/emhttp/plugins/snapunraid/images"/>
+  <FILE Run="/bin/bash">
+  <INLINE>
+<![CDATA[
+# Pre-install cleanup. This was previously a bare top-level
+# <RUN command="rm -rf ..."/> (plus two mkdir) at the start of the plugin, but
+# Unraid's installer only processes <FILE> elements and silently ignores
+# top-level <RUN>, so those never ran. Keeping it as the first FILE element
+# preserves the original ordering: clean the old tree, then let the following
+# FILE blocks repopulate it.
+rm -rf /usr/local/emhttp/plugins/snapunraid
+mkdir -p /usr/local/emhttp/plugins/snapunraid/scripts
+mkdir -p /usr/local/emhttp/plugins/snapunraid/images
+]]>
+  </INLINE>
+  </FILE>
 
   <FILE Name="/usr/local/emhttp/plugins/snapunraid/snapunraid.page">
   <INLINE>
@@ -3797,7 +3810,7 @@ exit $SYNC_RC
   </INLINE>
   </FILE>
 
-  <FILE Name="/usr/local/emhttp/plugins/snapunraid/event/started">
+  <FILE Name="/usr/local/emhttp/plugins/snapunraid/event/started" Mode="0755">
   <INLINE>
 <![CDATA[#!/bin/bash
 #
@@ -3805,16 +3818,23 @@ exit $SYNC_RC
 #
 # Unraid's plugin manager runs any executable file named after a lifecycle
 # event (e.g. "started") that it finds under a plugin's event/ directory.
-# This one fires after the array/webGUI environment is up, and its only
-# job is to relink our persisted SnapRAID binary from the boot flash back
-# into /usr/local/sbin - cheap, and necessary because the root filesystem
-# is rebuilt from scratch (RAM-based) on every boot.
+# This one fires after the array/webGUI environment is up, and its job is to
+# rebuild the two runtime artifacts that live outside the persisted flash
+# config, both of which are wiped because the root filesystem is rebuilt from
+# scratch (RAM-based) on every boot:
+#
+#   1. relink the persisted SnapRAID binary from the boot flash back into
+#      /usr/local/sbin (install_snapraid.sh);
+#   2. rewrite /etc/cron.d/snapunraid from settings.ini so the sync/scrub/
+#      health-check schedule survives the reboot (install_cron.sh).
 #
 # NOTE: the exact event name/timing guarantees of Unraid's plugin event
 # system should be double-checked against your Unraid version - if this
-# hook doesn't fire as expected, calling install_snapraid.sh once from the
-# Setup tab after boot achieves the same result (it's the same fast
-# symlink-relink path when a persisted binary already exists on flash).
+# hook doesn't fire as expected, calling install_snapraid.sh and
+# install_cron.sh once from the Setup tab after boot achieves the same
+# result (install_snapraid.sh is the fast symlink-relink path when a
+# persisted binary already exists on flash; saving Setup runs
+# install_cron.sh).
 #
 SCRIPT_DIR="/usr/local/emhttp/plugins/snapunraid/scripts"
 
@@ -3823,6 +3843,11 @@ SCRIPT_DIR="/usr/local/emhttp/plugins/snapunraid/scripts"
 mkdir -p /var/local/snapunraid/logs
 
 bash "${SCRIPT_DIR}/install_snapraid.sh" >> /var/local/snapunraid/logs/boot-relink.log 2>&1 &
+
+# Reinstall the cron schedule at boot. Without this the schedule is only ever
+# written when Set up is saved, so a reboot would silently leave the array
+# unprotected until someone revisited the plugin page.
+bash "${SCRIPT_DIR}/install_cron.sh" >> /var/local/snapunraid/logs/boot-cron.log 2>&1 &
 ]]>
   </INLINE>
   </FILE>
@@ -3849,9 +3874,21 @@ sync builds parity across your chosen data disks.
   </INLINE>
   </FILE>
 
-  <RUN command="chmod +x /usr/local/emhttp/plugins/snapunraid/*.sh /usr/local/emhttp/plugins/snapunraid/scripts/*.sh"/>
-  <RUN command="mkdir -p /var/local/snapunraid/logs"/>
-  <EVENT id="started" command="/usr/local/emhttp/plugins/snapunraid/event/started"/>
+  <FILE Run="/bin/bash">
+  <INLINE>
+<![CDATA[
+# Post-install: Unraid's plugin installer only processes <FILE> elements (a
+# bare top-level <RUN command="..."> is ignored), so the housekeeping that used
+# to live in <RUN> tags is executed here instead.
+#
+# Ensure the event hook is executable. Unraid's emhttp_event dispatcher only
+# runs hooks that have the +x bit, and without it the boot-time binary relink
+# and cron reinstall never happen.
+chmod +x /usr/local/emhttp/plugins/snapunraid/event/* 2>/dev/null
+mkdir -p /var/local/snapunraid/logs
+]]>
+  </INLINE>
+  </FILE>
 
   <FILE Name="/usr/local/emhttp/plugins/snapunraid/uninstall.sh"
         Run="bash" Method="remove">
