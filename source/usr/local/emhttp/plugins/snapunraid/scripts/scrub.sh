@@ -77,10 +77,16 @@ if [[ $CANCELLED -eq 1 ]]; then
     sre_abort_cancelled "Scrub cancelled by user."
 fi
 
-# Error count straight from the scrub log's machine-readable summary:* tags
-# (soft + io + data). This replaces the old `snapraid status` grep, which
-# actually returned the TOTAL file count, not the number of bad files.
-ERRORS=$(sre_log_error_count "$LOGFILE")
+# Error counts from the scrub log. snapraid's summary:error_* tags count error
+# BLOCKS, and one damaged/deleted file spans many blocks (a 115k-block scrub can
+# be only 25 files). The Dashboard and the Recover tab talk in files, so derive
+# the unique-file counts from the same tag parser the Recover tab uses, and keep
+# the raw block count separately for anyone who wants the detail. Parse once:
+# the log can be very large, so avoid a second full pass.
+ERRORS=$(sre_log_error_count "$LOGFILE")            # blocks (soft+io+data)
+PROBLEM_TAGS=$(sre_parse_problem_tags "$LOGFILE")
+BAD_FILES=$(awk 'END {print NR+0}' <<<"$PROBLEM_TAGS")
+MISSING=$(awk -F'\t' '$3 == "missing" {n++} END {print n+0}' <<<"$PROBLEM_TAGS")
 
 # Human summary + wall-clock duration for the notification.
 SUMMARY=$(sre_log_summary "$LOGFILE" "scrub")
@@ -90,7 +96,8 @@ sre_prune_logs
 
 if [[ $SCRUB_RC -eq 0 && $ERRORS -eq 0 ]]; then
     sre_write_state "scrub_status" "ok" "scrub_finished" "$(date +%s)" \
-        "scrub_last_bad_files" "0" "scrub_last_log" "$LOGFILE" "scrub_last_error" "" "scrub_pid" "" "scrub_progress" "" \
+        "scrub_last_bad_files" "0" "scrub_last_bad_blocks" "0" "scrub_last_log" "$LOGFILE" \
+        "scrub_last_error" "" "scrub_pid" "" "scrub_progress" "" \
         "scrub_missing_files" "0"
     sre_append_history "scrub" "ok" "bad_files" "0" "log" "$LOGFILE"
     sre_notify "Scrub completed" "${SUMMARY}${DURATION:+, took ${DURATION}}." "normal"
@@ -99,18 +106,17 @@ else
     # renamed since the last sync - expected after legitimate changes, not
     # corruption. If that is ALL the scrub found, point at a sync instead of
     # the Recover tab's restore flow, which would resurrect deleted files.
-    MISSING=$(sre_log_missing_count "$LOGFILE")
-    MISSING=${MISSING:-0}
     sre_write_state "scrub_status" "issues_found" "scrub_finished" "$(date +%s)" \
-        "scrub_last_bad_files" "$ERRORS" "scrub_last_log" "$LOGFILE" "scrub_pid" "" "scrub_progress" "" \
+        "scrub_last_bad_files" "$BAD_FILES" "scrub_last_bad_blocks" "$ERRORS" \
+        "scrub_last_log" "$LOGFILE" "scrub_pid" "" "scrub_progress" "" \
         "scrub_missing_files" "$MISSING"
-    sre_append_history "scrub" "issues" "bad_files" "$ERRORS" "log" "$LOGFILE"
-    if [[ $MISSING -gt 0 && $MISSING -eq $ERRORS ]]; then
-        MSG="All ${ERRORS} scrub errors are from files deleted or renamed since the last sync - not corruption. Run a sync to update parity and clear them."
+    sre_append_history "scrub" "issues" "bad_files" "$BAD_FILES" "log" "$LOGFILE"
+    if [[ $MISSING -gt 0 && $MISSING -eq $BAD_FILES ]]; then
+        MSG="All ${BAD_FILES} scrub error file(s) are from files deleted or renamed since the last sync - not corruption. Run a sync to update parity and clear them."
         sre_append_history "scrub" "issues" "message" "$MSG" "log" "$LOGFILE"
         sre_notify "Scrub: files deleted since last sync" "${MSG}${DURATION:+ (took ${DURATION})}" "warning"
     else
-        sre_notify "Scrub found problems" "${SUMMARY}${DURATION:+, took ${DURATION}}. Open the Recover tab in SnapUnraid." "alert"
+        sre_notify "Scrub found problems" "${BAD_FILES} file(s) flagged. ${SUMMARY}${DURATION:+, took ${DURATION}}. Open the Recover tab in SnapUnraid." "alert"
     fi
 fi
 

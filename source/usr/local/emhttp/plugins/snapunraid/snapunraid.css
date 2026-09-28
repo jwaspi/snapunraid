@@ -132,6 +132,8 @@
     padding: 8px 0; border-bottom: 1px solid rgba(128,128,128,0.15); font-size: 13px;
 }
 
+.sre-problem-disks { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+
 /* History table + log modal */
 .sre-history-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .sre-history-table th, .sre-history-table td { text-align: left; padding: 7px 9px; border-bottom: 1px solid rgba(128,128,128,0.15); }

@@ -122,7 +122,13 @@
                 state.scrub_status === 'running' ? ('Scrub in progress...' + (state.scrub_progress ? ` ${state.scrub_progress}%` : '') + (state.scrub_eta ? ` (ETA ${state.scrub_eta})` : '')) :
                 (state.scrub_status === 'cancelled' ? 'Scrub cancelled' :
                 (state.scrub_last_bad_files !== undefined
-                    ? (state.scrub_last_bad_files > 0 ? `${state.scrub_last_bad_files} file(s) flagged` : 'No corruption found')
+                    ? (state.scrub_last_bad_files > 0
+                        // scrub_last_bad_files is unique files; snapraid itself
+                        // reports error blocks, so show both when they differ.
+                        ? `${state.scrub_last_bad_files} file(s) flagged` +
+                          (Number(state.scrub_last_bad_blocks || 0) > Number(state.scrub_last_bad_files || 0)
+                            ? ` (${state.scrub_last_bad_blocks} blocks)` : '')
+                        : 'No corruption found')
                     : 'No scrub run yet'));
 
             // Show the Cancel button only while the matching operation is running.
@@ -795,7 +801,16 @@
                 summaryEl.textContent = `${real.length} damaged file(s)${unrecoverable ? `, ${unrecoverable} unrecoverable` : ''} - ~${humanBytes(totalSize)} to restore.` +
                     (missing.length ? ` Another ${missing.length} file(s) were deleted or renamed since the last sync - not damage; run a Sync to clear them.` : '');
             }
-            list.innerHTML = [...real, ...missing].map(p => {
+            // Per-disk restore: snapraid can rebuild everything on one disk
+            // with `fix -d <label>`, which is more reliable than filtering
+            // file-by-file. Offer one button per disk that has damaged files.
+            const disksWithDamage = [...new Set(real.map(p => p.disk))];
+            const diskBtns = disksWithDamage.length > 1
+                ? '<div class="sre-problem-disks">' + disksWithDamage.map(d =>
+                    `<button class="sre-btn sre-btn-warn sre-fix-disk" data-disk="${esc(d)}">Restore all on ${esc(d)}</button>`
+                  ).join('') + '</div>'
+                : '';
+            list.innerHTML = diskBtns + [...real, ...missing].map(p => {
                 if (p.reason === 'missing') {
                     return `<div class="sre-problem-item">
                         <span>${esc(p.path)} <span style="opacity:.6">(${esc(p.disk)}, deleted since last sync)</span></span>
@@ -811,6 +826,13 @@
                 btn.addEventListener('click', () => {
                     btn.textContent = 'Restoring\u2026';
                     post('fix_file', { path: btn.dataset.path }).then(() => loadRecover());
+                });
+            });
+            document.querySelectorAll('.sre-fix-disk').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    if (!confirm('Restore all damaged files on ' + btn.dataset.disk + ' from parity?')) return;
+                    btn.textContent = 'Restoring\u2026';
+                    post('fix_disk', { disk: btn.dataset.disk }).then(() => loadRecover());
                 });
             });
         });

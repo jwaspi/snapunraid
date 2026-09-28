@@ -47,14 +47,27 @@ sre_get_setting() {
 }
 
 sre_set_setting() {
+    # Rewrite the file in bash rather than with `sed -i`. A value can contain
+    # sed metacharacters (EXCLUDES patterns are user-supplied and paths can
+    # contain '&' or '|'), and in sed's replacement '&' re-inserts the old
+    # match while '|' closes the s|...|...| expression - either silently
+    # corrupts settings.ini. A stream rewrite has no such pitfalls and is
+    # atomic enough (temp file + mv).
     local key="$1"
     local value="$2"
     touch "$SETTINGS_FILE"
-    if grep -qE "^${key}=" "$SETTINGS_FILE" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=${value}|" "$SETTINGS_FILE"
-    else
-        echo "${key}=${value}" >> "$SETTINGS_FILE"
-    fi
+    local tmp found=0 line
+    tmp=$(mktemp)
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "${key}="* ]]; then
+            printf '%s=%s\n' "$key" "$value"
+            found=1
+        else
+            printf '%s\n' "$line"
+        fi
+    done < "$SETTINGS_FILE" > "$tmp"
+    [[ $found -eq 0 ]] && printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    mv "$tmp" "$SETTINGS_FILE"
 }
 
 # ---------------------------------------------------------------------------
@@ -68,9 +81,13 @@ sre_log_start() {
 }
 
 sre_prune_logs() {
-    # keep the most recent 30 logs of each kind
-    ls -1t "${LOG_DIR}"/sync-*.log 2>/dev/null | tail -n +31 | xargs -r rm -f
-    ls -1t "${LOG_DIR}"/scrub-*.log 2>/dev/null | tail -n +31 | xargs -r rm -f
+    # keep the most recent 30 logs of each kind. Include check- and fix- logs:
+    # they are created in the same tmpfs log dir and a full check on a degraded
+    # array can produce very large logs, so leaving them unpruned can fill RAM.
+    local kind
+    for kind in sync scrub check fix; do
+        ls -1t "${LOG_DIR}"/"${kind}"-*.log 2>/dev/null | tail -n +31 | xargs -r rm -f
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -258,6 +275,81 @@ sre_poll_progress() {
 }
 
 # ---------------------------------------------------------------------------
+# Problem-file extraction (shared by recover.sh list and check).
+#
+# Parses the machine-readable tags snapraid writes with --log:
+#   error:<block>:<disk>:<sub>: ...          (soft error / checksum mismatch)
+#   error_data:<block>:<disk>:<sub>: ...     (silent corruption)
+#   status:recoverable:<disk>:<sub>          (from check)
+#   status:unrecoverable:<disk>:<sub>
+# and prints unique "disk\tpath\treason\tsize" rows (tab separated).
+#
+# Implemented as a single awk|sort pass, NOT per-line jq/shell: a scrub or
+# check that flags every block of many deleted files can emit 100k+ tag lines,
+# and spawning a process per line takes minutes. One awk pass plus one sort is
+# linear. The disk field is resolved to its mount path via sre_disk_mount
+# (labels like "d6" map to /mnt/disk4), and a path containing ':' is preserved
+# because awk only splits the leading fixed fields (the sub-path is the rest of
+# the line).
+#
+#   sre_parse_problem_tags <logfile>
+# ---------------------------------------------------------------------------
+sre_parse_problem_tags() {
+    local logfile="$1"
+    [[ -f "$logfile" ]] || return 0
+    # Collect unique disk|sub|reason triples first (sort -u collapses the many
+    # per-block repeats of the same file), then resolve each disk once. A cache
+    # keyed by disk avoids re-parsing snapraid.conf for every row.
+    awk '
+        BEGIN { FS = ":" }
+        function emit(disk, path, reason) {
+            if (disk == "" || path == "") return
+            print disk "\t" path "\t" reason
+        }
+        $1 == "error" || $1 == "error_data" {
+            # Fields: tag : block : disk : sub : message...
+            # $2 is the block number; anchor on it so "error:" mentions inside
+            # other text can not be mistaken for a tag.
+            if ($2 !~ /^[0-9]+$/) next
+            reason = "checksum mismatch"
+            if ($0 ~ /Open error\. No such file or directory\./) reason = "missing"
+            # sub is everything after the disk field, minus the trailing
+            # " : <message>". Strip the message only when it is the known
+            # trailing text; otherwise keep the whole remainder.
+            line = $0
+            gsub(/^[^:]*:[0-9]+:[^:]*:/, "", line)          # drop tag:block:disk:
+            if (reason == "missing") gsub(/: Open error\. No such file or directory\.$/, "", line)
+            else gsub(/: (Data|Unrecoverable) error.*$/, "", line)
+            emit($3, line, reason)
+            next
+        }
+        $1 == "status" && ($2 == "recoverable" || $2 == "unrecoverable") {
+            line = $0
+            gsub(/^status:(recoverable|unrecoverable):[^:]*:/, "", line)
+            emit($3, line, $2)
+        }
+    ' "$logfile" | sort -u
+}
+
+# Resolve "<disk>\t<sub>\t<reason>" rows into "<disk>\t<fullpath>\t<reason>\t<size>".
+# Reads stdin, writes stdout. Uses a per-disk mount cache.
+sre_resolve_problem_paths() {
+    local disk sub reason mount size path
+    declare -A _sre_mount_cache=()
+    while IFS=$'\t' read -r disk sub reason; do
+        [[ -z "$disk" || -z "$sub" ]] && continue
+        if [[ -z "${_sre_mount_cache[$disk]:-}" ]]; then
+            _sre_mount_cache[$disk]=$(sre_disk_mount "$disk")
+        fi
+        mount="${_sre_mount_cache[$disk]}"
+        path="${mount}/${sub#/}"
+        size=0
+        [[ -f "$path" ]] && size=$(stat -c %s "$path" 2>/dev/null || echo 0)
+        printf '%s\t%s\t%s\t%s\n' "$disk" "$path" "$reason" "${size:-0}"
+    done
+}
+
+# ---------------------------------------------------------------------------
 # History - append a completed run to the persistent history file.
 # Each record is one JSON object per line (JSONL). Oldest entries are pruned to
 # HISTORY_MAX. Used by the History tab.
@@ -361,7 +453,57 @@ sre_log_missing_count() {
     # directory." - blocks of files that were deleted or renamed since the last
     # sync. Expected after legitimate changes, NOT corruption; the remedy is a
     # sync, not a restore (restoring would resurrect the deleted files).
-    grep -cE '^error:[0-9]+:[a-zA-Z0-9]+:[^:]*: Open error\. No such file or directory\.' "$1" 2>/dev/null
+    # The disk token can be a generated label (d1, d6) or an imported name with
+    # '-' or '_', so don't constrain it to alphanumerics. Only the trailing
+    # message is anchored, and a ':' in the path can't be confused with the
+    # message because the message itself contains a literal '.' and spaces.
+    grep -cE '^error:[0-9]+:[^:]+:.*Open error\. No such file or directory\.' "$1" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Disk label -> mount path resolution.
+#
+# SnapRAID's error:/status: log tags carry the disk LABEL as declared in
+# snapraid.conf ("data d6 /mnt/disk4/"), not the mount name. genconfig.sh
+# generates those labels (d1, d2, ...), so a naive "/mnt/${label}/..." rebuild
+# points at a directory that doesn't exist (there is no /mnt/d6). Resolve the
+# label through the config instead. Falls back to the label itself when the
+# config can't be parsed, preserving the old behaviour.
+#
+#   sre_disk_mount <label>   -> prints the mount path (e.g. /mnt/disk4)
+# ---------------------------------------------------------------------------
+sre_disk_mount() {
+    local label="$1" kw lbl mp
+    if [[ -f "$SNAPRAID_CONF" ]]; then
+        # Only `data` lines carry a disk label; `parity`/`content` lines do not.
+        while read -r kw lbl mp _; do
+            [[ "$kw" == "data" ]] || continue
+            if [[ "$lbl" == "$label" && -n "$mp" ]]; then
+                printf '%s\n' "${mp%/}"
+                return 0
+            fi
+        done < "$SNAPRAID_CONF"
+    fi
+    printf '/mnt/%s\n' "$label"
+}
+
+# Reverse of sre_disk_mount: given an absolute path under a data mount, print
+# "<label>\t<relative-sub>" (the form snapraid's -d/-f filters want). Prints
+# nothing if the path isn't under any configured data disk.
+sre_split_disk_path() {
+    local abspath="$1" kw lbl mp rel
+    [[ -f "$SNAPRAID_CONF" ]] || return 1
+    while read -r kw lbl mp _; do
+        [[ "$kw" == "data" ]] || continue
+        mp="${mp%/}"
+        [[ -n "$mp" ]] || continue
+        if [[ "$abspath" == "$mp/"* ]]; then
+            rel="${abspath#"$mp"/}"
+            printf '%s\t%s\n' "$lbl" "$rel"
+            return 0
+        fi
+    done < "$SNAPRAID_CONF"
+    return 1
 }
 
 # ---------------------------------------------------------------------------

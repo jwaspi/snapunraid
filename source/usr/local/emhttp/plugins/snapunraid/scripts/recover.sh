@@ -22,41 +22,21 @@ fi
 
 case "$ACTION" in
     list)
-        # Parse the most recent check/scrub/sync log for per-file problems.
-        # SnapRAID writes machine-readable tags when run with --log:
-        #   error_data:<block>:<disk>:<sub>: Data error at position ...   (silent corruption)
-        #   error:<block>:<disk>:<sub>: Data error at position ...        (soft error)
-        #   status:recoverable:<disk>:<sub>   / status:unrecoverable:<disk>:<sub>  (from check)
-        # plus a human-readable line: Data error in file '/mnt/...' at position ...
-        # The tag paths are relative to the disk mount, so we rebuild the full
-        # path as /mnt/<disk>/<sub>. Pure bash + jq (python3 not guaranteed).
+        # Parse the most recent check/scrub/sync log for per-file problems via
+        # the shared single-pass parser in common.sh. That parser handles the
+        # disk-label -> mount mapping (labels like "d6" are declared in
+        # snapraid.conf as /mnt/disk4, so /mnt/d6 would be wrong) and preserves
+        # paths containing ':'.
         #
-        # Deduplication is done with awk+sort, NOT per-line jq: a scrub with
-        # 100k+ error blocks (e.g. every block of deleted files) would spawn a
-        # jq process per line and take minutes. One jq call builds the JSON.
+        # Deduplication and parsing are done with one awk|sort pass, NOT
+        # per-line jq: a scrub with 100k+ error blocks (e.g. every block of
+        # deleted files) would spawn a process per line and take minutes. One
+        # jq call at the end builds the JSON array.
         state=$(sre_read_state_json)
         log=$(jq -r '.check_last_log // .scrub_last_log // .sync_last_log // ""' <<<"$state" 2>/dev/null)
         if [[ -n "$log" && -f "$log" ]]; then
-            # Extract unique (disk, path, reason) triples from the machine
-            # tags. "Open error. No such file or directory." marks a file that
-            # was deleted or renamed since the last sync - not damage;
-            # restoring it would undo the deletion, the remedy is a sync.
-            awk -F':' '
-                ($1 == "error" || $1 == "error_data") && $2 ~ /^[0-9]+$/ {
-                    r = "checksum mismatch"
-                    if ($0 ~ /Open error\. No such file or directory\./) r = "missing"
-                    print $3 "\t" $4 "\t" r
-                }
-                $1 == "status" && ($2 == "recoverable" || $2 == "unrecoverable") {
-                    print $3 "\t" $4 "\t" $2
-                }
-            ' "$log" | sort -u | while IFS=$'\t' read -r disk sub reason; do
-                [[ -z "$disk" || -z "$sub" ]] && continue
-                path="/mnt/${disk}/${sub#/}"
-                size=0
-                [[ -f "$path" ]] && size=$(stat -c %s "$path" 2>/dev/null || echo 0)
-                printf '%s\t%s\t%s\t%s\n' "$disk" "$path" "$reason" "$size"
-            done | jq -R -c 'split("\t") | {disk: .[0], path: .[1], reason: .[2], size: (.[3] | tonumber)}' \
+            sre_parse_problem_tags "$log" | sre_resolve_problem_paths \
+                | jq -R -c 'split("\t") | {disk: .[0], path: .[1], reason: .[2], size: (.[3] | tonumber)}' \
                 | jq -c -s 'if length == 0 then [] else . end'
         else
             echo "[]"
@@ -98,20 +78,12 @@ case "$ACTION" in
         if [[ $CANCELLED -eq 1 ]]; then
             sre_abort_cancelled "Array check cancelled by user."
         fi
-        # Parse the check log for per-file results.
-        PROBLEMS="[]"
-        while IFS= read -r line; do
-            if [[ "$line" =~ ^status:(recoverable|unrecoverable):([^:]+):([^:]+)$ ]]; then
-                disk="${BASH_REMATCH[2]}"
-                path="/mnt/${disk}/${BASH_REMATCH[3]#/}"
-                reason="unrecoverable"
-                [[ "${BASH_REMATCH[1]}" == "recoverable" ]] && reason="recoverable"
-                size=0
-                [[ -f "$path" ]] && size=$(stat -c %s "$path" 2>/dev/null || echo 0)
-                PROBLEMS=$(jq -c --arg d "$disk" --arg p "$path" --arg r "$reason" --argjson s "${size:-0}" \
-                    '. + [{disk:$d,path:$p,reason:$r,size:$s}]' <<<"$PROBLEMS")
-            fi
-        done < "$LOGFILE"
+        # Parse the check log for per-file results using the same single-pass
+        # parser as `list` (one awk|sort + one jq instead of a jq per line).
+        PROBLEMS=$(sre_parse_problem_tags "$LOGFILE" | sre_resolve_problem_paths \
+            | jq -R -c 'split("\t") | {disk: .[0], path: .[1], reason: .[2], size: (.[3] | tonumber)}' \
+            | jq -c -s 'if length == 0 then [] else . end')
+        PROBLEMS=${PROBLEMS:-[]}
         sre_prune_logs
         if [[ $CHECK_RC -eq 0 ]]; then
             sre_write_state "check_status" "ok" "check_finished" "$(date +%s)" \
@@ -148,9 +120,22 @@ case "$ACTION" in
             echo "Usage: recover.sh fix-file <path>" >&2
             exit 1
         fi
+        # snapraid's --filter matches paths RELATIVE to the disk mount, so an
+        # absolute /mnt/... path never matches ("Nothing to check"). Split the
+        # path into its disk label and relative sub-path and pass both.
+        SPLIT=$(sre_split_disk_path "$ARG")
+        if [[ -z "$SPLIT" ]]; then
+            LOGFILE=$(sre_log_start "fix")
+            MSG="Could not map '${ARG}' to a configured data disk - it may not be under /mnt/<disk>. Check Setup."
+            echo "$MSG" | tee -a "$LOGFILE"
+            echo "{\"exit_code\": 1, \"log\": \"$LOGFILE\", \"error\": \"${MSG}\"}"
+            exit 1
+        fi
+        DISK_LABEL="${SPLIT%%$'\t'*}"
+        DISK_REL="${SPLIT#*$'\t'}"
         sre_lock
         LOGFILE=$(sre_log_start "fix")
-        snapraid --conf "$SNAPRAID_CONF" fix -f "$ARG" >> "$LOGFILE" 2>&1
+        snapraid --conf "$SNAPRAID_CONF" fix -d "$DISK_LABEL" -f "$DISK_REL" >> "$LOGFILE" 2>&1
         RC=$?
         if [[ $RC -eq 0 ]]; then
             sre_notify "Recovery completed" "Restored '${ARG}' from parity." "normal"

@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "snapunraid">
   <!ENTITY author    "jwaspi">
-  <!ENTITY version   "2026.09.26">
+  <!ENTITY version   "2026.09.28">
   <!ENTITY launch    "Settings/snapunraid">
   <!ENTITY pluginURL "https://raw.githubusercontent.com/jwaspi/snapunraid/main/snapunraid.plg">
   <!ENTITY support   "https://github.com/jwaspi/snapunraid/issues">
@@ -10,6 +10,10 @@
 <PLUGIN name="snapunraid" version="&version;" author="&author;" icon="camera"
         pluginURL="&pluginURL;" support="&support;" launch="&launch;">
   <CHANGES><![CDATA[
+2026.09.28 - FIX: the Recover tab listed wrong paths and could not restore files. SnapRAID's error:/status: log tags carry the disk LABEL declared in snapraid.conf ("data d6 /mnt/disk4/"), not the mount name, so the old "/mnt/<label>/..." rebuild produced paths like /mnt/d6/... that don't exist, every listed size was 0, and "Restore this file" ran `snapraid fix -f <absolute path>` - which matches nothing, because --filter patterns are relative to the disk mount. Paths are now resolved through snapraid.conf, and single-file restore passes `-d <label> -f <relative path>`. A per-disk "Restore all on <disk>" button (using the previously-unreachable fix -d path) is now offered when more than one disk has damage.
+2026.09.28 - FIX: the Dashboard and scrub notification reported error BLOCKS as if they were files (a scrub flagging 115,700 blocks was really only 25 distinct files). The reported bad-file count is now the number of unique files, with the raw block count shown alongside it, and the "deleted since last sync" detection compares like with like so it can no longer be missed.
+2026.09.28 - FIX: a config value containing '&' or '|' silently corrupted settings.ini - sre_set_setting used sed, where '&' re-inserts the old match and '|' closes the s|...|...| expression. Values (e.g. imported exclude patterns or paths) are now written without sed. Settings writes are also written atomically (temp file + rename) so a concurrent sync/scrub or page load never reads a half-written file.
+2026.09.28 - A full check now parses its results with one awk|sort pass instead of spawning a jq process per tag line (the same change already made for the Recover list), so a check on a degraded array no longer hangs for minutes. check- and fix- logs are now pruned like sync/scrub logs, so they can't grow without bound in RAM.
 2026.09.26 - FIX: the sync/scrub/health-check schedule did not survive a reboot. /etc/cron.d/snapunraid lives on the RAM rootfs and was only ever written when Setup was saved, so after every reboot no cron entries existed until someone reopened the plugin - the array silently ran unprotected. The event/started hook now reinstalls the schedule from settings.ini at boot. It is also shipped executable via a FILE Mode="0755" attribute, because the plugin's old top-level <RUN command="chmod ..."> never executed (Unraid's installer only processes <FILE> elements) and Unraid's emhttp_event dispatcher only runs hooks with the +x bit - so the hook had never run at all. The ignored <EVENT> tag was removed and the dead <RUN> housekeeping moved into an executable inline post-install FILE block.
 2026.09.14 - Dashboard: a scrub that only flagged files deleted since the last sync now shows a warning "Sync needed" instead of the red "Attention needed", and a successful sync automatically clears that status so the Dashboard returns to "Protected" without waiting for the next scrub. Real corruption still shows "Attention needed".
 2026.09.13 - Recover tab: scrub errors for files deleted since the last sync ("Open error - No such file or directory") are now labeled as such and are no longer offered for restore - restoring would bring the deleted files back. If ALL scrub errors are of this kind the notification and Recover tab now say to run a sync instead, and "Restore all" is hidden. Also fixes the Recover tab hanging for minutes when a scrub logs 100k+ errors (the per-line jq dedupe was replaced with a single awk/sort pass).
@@ -530,6 +534,8 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
     padding: 8px 0; border-bottom: 1px solid rgba(128,128,128,0.15); font-size: 13px;
 }
 
+.sre-problem-disks { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+
 /* History table + log modal */
 .sre-history-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .sre-history-table th, .sre-history-table td { text-align: left; padding: 7px 9px; border-bottom: 1px solid rgba(128,128,128,0.15); }
@@ -687,7 +693,13 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
                 state.scrub_status === 'running' ? ('Scrub in progress...' + (state.scrub_progress ? ` ${state.scrub_progress}%` : '') + (state.scrub_eta ? ` (ETA ${state.scrub_eta})` : '')) :
                 (state.scrub_status === 'cancelled' ? 'Scrub cancelled' :
                 (state.scrub_last_bad_files !== undefined
-                    ? (state.scrub_last_bad_files > 0 ? `${state.scrub_last_bad_files} file(s) flagged` : 'No corruption found')
+                    ? (state.scrub_last_bad_files > 0
+                        // scrub_last_bad_files is unique files; snapraid itself
+                        // reports error blocks, so show both when they differ.
+                        ? `${state.scrub_last_bad_files} file(s) flagged` +
+                          (Number(state.scrub_last_bad_blocks || 0) > Number(state.scrub_last_bad_files || 0)
+                            ? ` (${state.scrub_last_bad_blocks} blocks)` : '')
+                        : 'No corruption found')
                     : 'No scrub run yet'));
 
             // Show the Cancel button only while the matching operation is running.
@@ -1360,7 +1372,16 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
                 summaryEl.textContent = `${real.length} damaged file(s)${unrecoverable ? `, ${unrecoverable} unrecoverable` : ''} - ~${humanBytes(totalSize)} to restore.` +
                     (missing.length ? ` Another ${missing.length} file(s) were deleted or renamed since the last sync - not damage; run a Sync to clear them.` : '');
             }
-            list.innerHTML = [...real, ...missing].map(p => {
+            // Per-disk restore: snapraid can rebuild everything on one disk
+            // with `fix -d <label>`, which is more reliable than filtering
+            // file-by-file. Offer one button per disk that has damaged files.
+            const disksWithDamage = [...new Set(real.map(p => p.disk))];
+            const diskBtns = disksWithDamage.length > 1
+                ? '<div class="sre-problem-disks">' + disksWithDamage.map(d =>
+                    `<button class="sre-btn sre-btn-warn sre-fix-disk" data-disk="${esc(d)}">Restore all on ${esc(d)}</button>`
+                  ).join('') + '</div>'
+                : '';
+            list.innerHTML = diskBtns + [...real, ...missing].map(p => {
                 if (p.reason === 'missing') {
                     return `<div class="sre-problem-item">
                         <span>${esc(p.path)} <span style="opacity:.6">(${esc(p.disk)}, deleted since last sync)</span></span>
@@ -1376,6 +1397,13 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
                 btn.addEventListener('click', () => {
                     btn.textContent = 'Restoring\u2026';
                     post('fix_file', { path: btn.dataset.path }).then(() => loadRecover());
+                });
+            });
+            document.querySelectorAll('.sre-fix-disk').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    if (!confirm('Restore all damaged files on ' + btn.dataset.disk + ' from parity?')) return;
+                    btn.textContent = 'Restoring\u2026';
+                    post('fix_disk', { disk: btn.dataset.disk }).then(() => loadRecover());
                 });
             });
         });
@@ -1505,6 +1533,8 @@ function sre_cancel_operation($pidKey) {
 // Merge key=value pairs into settings.ini, preserving any keys not being
 // updated (e.g. the alert toggles when the Setup form is saved, and vice
 // versa). Reads the existing file, applies the updates, writes it back.
+// Written via a temp file + rename so a concurrent reader (a running
+// sync/scrub or the Setup page) never sees a half-written file.
 function sre_ini_merge($updates) {
     global $settingsIni;
     $existing = [];
@@ -1520,7 +1550,16 @@ function sre_ini_merge($updates) {
     $out = '';
     foreach ($existing as $k => $v) { $out .= "{$k}={$v}\n"; }
     @mkdir(dirname($settingsIni), 0755, true);
-    file_put_contents($settingsIni, $out);
+    $tmp = $settingsIni . '.tmp.' . getmypid();
+    if (@file_put_contents($tmp, $out) === false) {
+        @unlink($tmp);
+        return false;
+    }
+    if (!@rename($tmp, $settingsIni)) {
+        @unlink($tmp);
+        return false;
+    }
+    return true;
 }
 
 switch ($action) {
@@ -2000,14 +2039,27 @@ sre_get_setting() {
 }
 
 sre_set_setting() {
+    # Rewrite the file in bash rather than with `sed -i`. A value can contain
+    # sed metacharacters (EXCLUDES patterns are user-supplied and paths can
+    # contain '&' or '|'), and in sed's replacement '&' re-inserts the old
+    # match while '|' closes the s|...|...| expression - either silently
+    # corrupts settings.ini. A stream rewrite has no such pitfalls and is
+    # atomic enough (temp file + mv).
     local key="$1"
     local value="$2"
     touch "$SETTINGS_FILE"
-    if grep -qE "^${key}=" "$SETTINGS_FILE" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=${value}|" "$SETTINGS_FILE"
-    else
-        echo "${key}=${value}" >> "$SETTINGS_FILE"
-    fi
+    local tmp found=0 line
+    tmp=$(mktemp)
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "${key}="* ]]; then
+            printf '%s=%s\n' "$key" "$value"
+            found=1
+        else
+            printf '%s\n' "$line"
+        fi
+    done < "$SETTINGS_FILE" > "$tmp"
+    [[ $found -eq 0 ]] && printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    mv "$tmp" "$SETTINGS_FILE"
 }
 
 # ---------------------------------------------------------------------------
@@ -2021,9 +2073,13 @@ sre_log_start() {
 }
 
 sre_prune_logs() {
-    # keep the most recent 30 logs of each kind
-    ls -1t "${LOG_DIR}"/sync-*.log 2>/dev/null | tail -n +31 | xargs -r rm -f
-    ls -1t "${LOG_DIR}"/scrub-*.log 2>/dev/null | tail -n +31 | xargs -r rm -f
+    # keep the most recent 30 logs of each kind. Include check- and fix- logs:
+    # they are created in the same tmpfs log dir and a full check on a degraded
+    # array can produce very large logs, so leaving them unpruned can fill RAM.
+    local kind
+    for kind in sync scrub check fix; do
+        ls -1t "${LOG_DIR}"/"${kind}"-*.log 2>/dev/null | tail -n +31 | xargs -r rm -f
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -2211,6 +2267,81 @@ sre_poll_progress() {
 }
 
 # ---------------------------------------------------------------------------
+# Problem-file extraction (shared by recover.sh list and check).
+#
+# Parses the machine-readable tags snapraid writes with --log:
+#   error:<block>:<disk>:<sub>: ...          (soft error / checksum mismatch)
+#   error_data:<block>:<disk>:<sub>: ...     (silent corruption)
+#   status:recoverable:<disk>:<sub>          (from check)
+#   status:unrecoverable:<disk>:<sub>
+# and prints unique "disk\tpath\treason\tsize" rows (tab separated).
+#
+# Implemented as a single awk|sort pass, NOT per-line jq/shell: a scrub or
+# check that flags every block of many deleted files can emit 100k+ tag lines,
+# and spawning a process per line takes minutes. One awk pass plus one sort is
+# linear. The disk field is resolved to its mount path via sre_disk_mount
+# (labels like "d6" map to /mnt/disk4), and a path containing ':' is preserved
+# because awk only splits the leading fixed fields (the sub-path is the rest of
+# the line).
+#
+#   sre_parse_problem_tags <logfile>
+# ---------------------------------------------------------------------------
+sre_parse_problem_tags() {
+    local logfile="$1"
+    [[ -f "$logfile" ]] || return 0
+    # Collect unique disk|sub|reason triples first (sort -u collapses the many
+    # per-block repeats of the same file), then resolve each disk once. A cache
+    # keyed by disk avoids re-parsing snapraid.conf for every row.
+    awk '
+        BEGIN { FS = ":" }
+        function emit(disk, path, reason) {
+            if (disk == "" || path == "") return
+            print disk "\t" path "\t" reason
+        }
+        $1 == "error" || $1 == "error_data" {
+            # Fields: tag : block : disk : sub : message...
+            # $2 is the block number; anchor on it so "error:" mentions inside
+            # other text can not be mistaken for a tag.
+            if ($2 !~ /^[0-9]+$/) next
+            reason = "checksum mismatch"
+            if ($0 ~ /Open error\. No such file or directory\./) reason = "missing"
+            # sub is everything after the disk field, minus the trailing
+            # " : <message>". Strip the message only when it is the known
+            # trailing text; otherwise keep the whole remainder.
+            line = $0
+            gsub(/^[^:]*:[0-9]+:[^:]*:/, "", line)          # drop tag:block:disk:
+            if (reason == "missing") gsub(/: Open error\. No such file or directory\.$/, "", line)
+            else gsub(/: (Data|Unrecoverable) error.*$/, "", line)
+            emit($3, line, reason)
+            next
+        }
+        $1 == "status" && ($2 == "recoverable" || $2 == "unrecoverable") {
+            line = $0
+            gsub(/^status:(recoverable|unrecoverable):[^:]*:/, "", line)
+            emit($3, line, $2)
+        }
+    ' "$logfile" | sort -u
+}
+
+# Resolve "<disk>\t<sub>\t<reason>" rows into "<disk>\t<fullpath>\t<reason>\t<size>".
+# Reads stdin, writes stdout. Uses a per-disk mount cache.
+sre_resolve_problem_paths() {
+    local disk sub reason mount size path
+    declare -A _sre_mount_cache=()
+    while IFS=$'\t' read -r disk sub reason; do
+        [[ -z "$disk" || -z "$sub" ]] && continue
+        if [[ -z "${_sre_mount_cache[$disk]:-}" ]]; then
+            _sre_mount_cache[$disk]=$(sre_disk_mount "$disk")
+        fi
+        mount="${_sre_mount_cache[$disk]}"
+        path="${mount}/${sub#/}"
+        size=0
+        [[ -f "$path" ]] && size=$(stat -c %s "$path" 2>/dev/null || echo 0)
+        printf '%s\t%s\t%s\t%s\n' "$disk" "$path" "$reason" "${size:-0}"
+    done
+}
+
+# ---------------------------------------------------------------------------
 # History - append a completed run to the persistent history file.
 # Each record is one JSON object per line (JSONL). Oldest entries are pruned to
 # HISTORY_MAX. Used by the History tab.
@@ -2314,7 +2445,57 @@ sre_log_missing_count() {
     # directory." - blocks of files that were deleted or renamed since the last
     # sync. Expected after legitimate changes, NOT corruption; the remedy is a
     # sync, not a restore (restoring would resurrect the deleted files).
-    grep -cE '^error:[0-9]+:[a-zA-Z0-9]+:[^:]*: Open error\. No such file or directory\.' "$1" 2>/dev/null
+    # The disk token can be a generated label (d1, d6) or an imported name with
+    # '-' or '_', so don't constrain it to alphanumerics. Only the trailing
+    # message is anchored, and a ':' in the path can't be confused with the
+    # message because the message itself contains a literal '.' and spaces.
+    grep -cE '^error:[0-9]+:[^:]+:.*Open error\. No such file or directory\.' "$1" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Disk label -> mount path resolution.
+#
+# SnapRAID's error:/status: log tags carry the disk LABEL as declared in
+# snapraid.conf ("data d6 /mnt/disk4/"), not the mount name. genconfig.sh
+# generates those labels (d1, d2, ...), so a naive "/mnt/${label}/..." rebuild
+# points at a directory that doesn't exist (there is no /mnt/d6). Resolve the
+# label through the config instead. Falls back to the label itself when the
+# config can't be parsed, preserving the old behaviour.
+#
+#   sre_disk_mount <label>   -> prints the mount path (e.g. /mnt/disk4)
+# ---------------------------------------------------------------------------
+sre_disk_mount() {
+    local label="$1" kw lbl mp
+    if [[ -f "$SNAPRAID_CONF" ]]; then
+        # Only `data` lines carry a disk label; `parity`/`content` lines do not.
+        while read -r kw lbl mp _; do
+            [[ "$kw" == "data" ]] || continue
+            if [[ "$lbl" == "$label" && -n "$mp" ]]; then
+                printf '%s\n' "${mp%/}"
+                return 0
+            fi
+        done < "$SNAPRAID_CONF"
+    fi
+    printf '/mnt/%s\n' "$label"
+}
+
+# Reverse of sre_disk_mount: given an absolute path under a data mount, print
+# "<label>\t<relative-sub>" (the form snapraid's -d/-f filters want). Prints
+# nothing if the path isn't under any configured data disk.
+sre_split_disk_path() {
+    local abspath="$1" kw lbl mp rel
+    [[ -f "$SNAPRAID_CONF" ]] || return 1
+    while read -r kw lbl mp _; do
+        [[ "$kw" == "data" ]] || continue
+        mp="${mp%/}"
+        [[ -n "$mp" ]] || continue
+        if [[ "$abspath" == "$mp/"* ]]; then
+            rel="${abspath#"$mp"/}"
+            printf '%s\t%s\n' "$lbl" "$rel"
+            return 0
+        fi
+    done < "$SNAPRAID_CONF"
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -2914,41 +3095,21 @@ fi
 
 case "$ACTION" in
     list)
-        # Parse the most recent check/scrub/sync log for per-file problems.
-        # SnapRAID writes machine-readable tags when run with --log:
-        #   error_data:<block>:<disk>:<sub>: Data error at position ...   (silent corruption)
-        #   error:<block>:<disk>:<sub>: Data error at position ...        (soft error)
-        #   status:recoverable:<disk>:<sub>   / status:unrecoverable:<disk>:<sub>  (from check)
-        # plus a human-readable line: Data error in file '/mnt/...' at position ...
-        # The tag paths are relative to the disk mount, so we rebuild the full
-        # path as /mnt/<disk>/<sub>. Pure bash + jq (python3 not guaranteed).
+        # Parse the most recent check/scrub/sync log for per-file problems via
+        # the shared single-pass parser in common.sh. That parser handles the
+        # disk-label -> mount mapping (labels like "d6" are declared in
+        # snapraid.conf as /mnt/disk4, so /mnt/d6 would be wrong) and preserves
+        # paths containing ':'.
         #
-        # Deduplication is done with awk+sort, NOT per-line jq: a scrub with
-        # 100k+ error blocks (e.g. every block of deleted files) would spawn a
-        # jq process per line and take minutes. One jq call builds the JSON.
+        # Deduplication and parsing are done with one awk|sort pass, NOT
+        # per-line jq: a scrub with 100k+ error blocks (e.g. every block of
+        # deleted files) would spawn a process per line and take minutes. One
+        # jq call at the end builds the JSON array.
         state=$(sre_read_state_json)
         log=$(jq -r '.check_last_log // .scrub_last_log // .sync_last_log // ""' <<<"$state" 2>/dev/null)
         if [[ -n "$log" && -f "$log" ]]; then
-            # Extract unique (disk, path, reason) triples from the machine
-            # tags. "Open error. No such file or directory." marks a file that
-            # was deleted or renamed since the last sync - not damage;
-            # restoring it would undo the deletion, the remedy is a sync.
-            awk -F':' '
-                ($1 == "error" || $1 == "error_data") && $2 ~ /^[0-9]+$/ {
-                    r = "checksum mismatch"
-                    if ($0 ~ /Open error\. No such file or directory\./) r = "missing"
-                    print $3 "\t" $4 "\t" r
-                }
-                $1 == "status" && ($2 == "recoverable" || $2 == "unrecoverable") {
-                    print $3 "\t" $4 "\t" $2
-                }
-            ' "$log" | sort -u | while IFS=$'\t' read -r disk sub reason; do
-                [[ -z "$disk" || -z "$sub" ]] && continue
-                path="/mnt/${disk}/${sub#/}"
-                size=0
-                [[ -f "$path" ]] && size=$(stat -c %s "$path" 2>/dev/null || echo 0)
-                printf '%s\t%s\t%s\t%s\n' "$disk" "$path" "$reason" "$size"
-            done | jq -R -c 'split("\t") | {disk: .[0], path: .[1], reason: .[2], size: (.[3] | tonumber)}' \
+            sre_parse_problem_tags "$log" | sre_resolve_problem_paths \
+                | jq -R -c 'split("\t") | {disk: .[0], path: .[1], reason: .[2], size: (.[3] | tonumber)}' \
                 | jq -c -s 'if length == 0 then [] else . end'
         else
             echo "[]"
@@ -2990,20 +3151,12 @@ case "$ACTION" in
         if [[ $CANCELLED -eq 1 ]]; then
             sre_abort_cancelled "Array check cancelled by user."
         fi
-        # Parse the check log for per-file results.
-        PROBLEMS="[]"
-        while IFS= read -r line; do
-            if [[ "$line" =~ ^status:(recoverable|unrecoverable):([^:]+):([^:]+)$ ]]; then
-                disk="${BASH_REMATCH[2]}"
-                path="/mnt/${disk}/${BASH_REMATCH[3]#/}"
-                reason="unrecoverable"
-                [[ "${BASH_REMATCH[1]}" == "recoverable" ]] && reason="recoverable"
-                size=0
-                [[ -f "$path" ]] && size=$(stat -c %s "$path" 2>/dev/null || echo 0)
-                PROBLEMS=$(jq -c --arg d "$disk" --arg p "$path" --arg r "$reason" --argjson s "${size:-0}" \
-                    '. + [{disk:$d,path:$p,reason:$r,size:$s}]' <<<"$PROBLEMS")
-            fi
-        done < "$LOGFILE"
+        # Parse the check log for per-file results using the same single-pass
+        # parser as `list` (one awk|sort + one jq instead of a jq per line).
+        PROBLEMS=$(sre_parse_problem_tags "$LOGFILE" | sre_resolve_problem_paths \
+            | jq -R -c 'split("\t") | {disk: .[0], path: .[1], reason: .[2], size: (.[3] | tonumber)}' \
+            | jq -c -s 'if length == 0 then [] else . end')
+        PROBLEMS=${PROBLEMS:-[]}
         sre_prune_logs
         if [[ $CHECK_RC -eq 0 ]]; then
             sre_write_state "check_status" "ok" "check_finished" "$(date +%s)" \
@@ -3040,9 +3193,22 @@ case "$ACTION" in
             echo "Usage: recover.sh fix-file <path>" >&2
             exit 1
         fi
+        # snapraid's --filter matches paths RELATIVE to the disk mount, so an
+        # absolute /mnt/... path never matches ("Nothing to check"). Split the
+        # path into its disk label and relative sub-path and pass both.
+        SPLIT=$(sre_split_disk_path "$ARG")
+        if [[ -z "$SPLIT" ]]; then
+            LOGFILE=$(sre_log_start "fix")
+            MSG="Could not map '${ARG}' to a configured data disk - it may not be under /mnt/<disk>. Check Setup."
+            echo "$MSG" | tee -a "$LOGFILE"
+            echo "{\"exit_code\": 1, \"log\": \"$LOGFILE\", \"error\": \"${MSG}\"}"
+            exit 1
+        fi
+        DISK_LABEL="${SPLIT%%$'\t'*}"
+        DISK_REL="${SPLIT#*$'\t'}"
         sre_lock
         LOGFILE=$(sre_log_start "fix")
-        snapraid --conf "$SNAPRAID_CONF" fix -f "$ARG" >> "$LOGFILE" 2>&1
+        snapraid --conf "$SNAPRAID_CONF" fix -d "$DISK_LABEL" -f "$DISK_REL" >> "$LOGFILE" 2>&1
         RC=$?
         if [[ $RC -eq 0 ]]; then
             sre_notify "Recovery completed" "Restored '${ARG}' from parity." "normal"
@@ -3261,10 +3427,16 @@ if [[ $CANCELLED -eq 1 ]]; then
     sre_abort_cancelled "Scrub cancelled by user."
 fi
 
-# Error count straight from the scrub log's machine-readable summary:* tags
-# (soft + io + data). This replaces the old `snapraid status` grep, which
-# actually returned the TOTAL file count, not the number of bad files.
-ERRORS=$(sre_log_error_count "$LOGFILE")
+# Error counts from the scrub log. snapraid's summary:error_* tags count error
+# BLOCKS, and one damaged/deleted file spans many blocks (a 115k-block scrub can
+# be only 25 files). The Dashboard and the Recover tab talk in files, so derive
+# the unique-file counts from the same tag parser the Recover tab uses, and keep
+# the raw block count separately for anyone who wants the detail. Parse once:
+# the log can be very large, so avoid a second full pass.
+ERRORS=$(sre_log_error_count "$LOGFILE")            # blocks (soft+io+data)
+PROBLEM_TAGS=$(sre_parse_problem_tags "$LOGFILE")
+BAD_FILES=$(awk 'END {print NR+0}' <<<"$PROBLEM_TAGS")
+MISSING=$(awk -F'\t' '$3 == "missing" {n++} END {print n+0}' <<<"$PROBLEM_TAGS")
 
 # Human summary + wall-clock duration for the notification.
 SUMMARY=$(sre_log_summary "$LOGFILE" "scrub")
@@ -3274,7 +3446,8 @@ sre_prune_logs
 
 if [[ $SCRUB_RC -eq 0 && $ERRORS -eq 0 ]]; then
     sre_write_state "scrub_status" "ok" "scrub_finished" "$(date +%s)" \
-        "scrub_last_bad_files" "0" "scrub_last_log" "$LOGFILE" "scrub_last_error" "" "scrub_pid" "" "scrub_progress" "" \
+        "scrub_last_bad_files" "0" "scrub_last_bad_blocks" "0" "scrub_last_log" "$LOGFILE" \
+        "scrub_last_error" "" "scrub_pid" "" "scrub_progress" "" \
         "scrub_missing_files" "0"
     sre_append_history "scrub" "ok" "bad_files" "0" "log" "$LOGFILE"
     sre_notify "Scrub completed" "${SUMMARY}${DURATION:+, took ${DURATION}}." "normal"
@@ -3283,18 +3456,17 @@ else
     # renamed since the last sync - expected after legitimate changes, not
     # corruption. If that is ALL the scrub found, point at a sync instead of
     # the Recover tab's restore flow, which would resurrect deleted files.
-    MISSING=$(sre_log_missing_count "$LOGFILE")
-    MISSING=${MISSING:-0}
     sre_write_state "scrub_status" "issues_found" "scrub_finished" "$(date +%s)" \
-        "scrub_last_bad_files" "$ERRORS" "scrub_last_log" "$LOGFILE" "scrub_pid" "" "scrub_progress" "" \
+        "scrub_last_bad_files" "$BAD_FILES" "scrub_last_bad_blocks" "$ERRORS" \
+        "scrub_last_log" "$LOGFILE" "scrub_pid" "" "scrub_progress" "" \
         "scrub_missing_files" "$MISSING"
-    sre_append_history "scrub" "issues" "bad_files" "$ERRORS" "log" "$LOGFILE"
-    if [[ $MISSING -gt 0 && $MISSING -eq $ERRORS ]]; then
-        MSG="All ${ERRORS} scrub errors are from files deleted or renamed since the last sync - not corruption. Run a sync to update parity and clear them."
+    sre_append_history "scrub" "issues" "bad_files" "$BAD_FILES" "log" "$LOGFILE"
+    if [[ $MISSING -gt 0 && $MISSING -eq $BAD_FILES ]]; then
+        MSG="All ${BAD_FILES} scrub error file(s) are from files deleted or renamed since the last sync - not corruption. Run a sync to update parity and clear them."
         sre_append_history "scrub" "issues" "message" "$MSG" "log" "$LOGFILE"
         sre_notify "Scrub: files deleted since last sync" "${MSG}${DURATION:+ (took ${DURATION})}" "warning"
     else
-        sre_notify "Scrub found problems" "${SUMMARY}${DURATION:+, took ${DURATION}}. Open the Recover tab in SnapUnraid." "alert"
+        sre_notify "Scrub found problems" "${BAD_FILES} file(s) flagged. ${SUMMARY}${DURATION:+, took ${DURATION}}. Open the Recover tab in SnapUnraid." "alert"
     fi
 fi
 

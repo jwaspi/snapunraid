@@ -43,6 +43,8 @@ function sre_cancel_operation($pidKey) {
 // Merge key=value pairs into settings.ini, preserving any keys not being
 // updated (e.g. the alert toggles when the Setup form is saved, and vice
 // versa). Reads the existing file, applies the updates, writes it back.
+// Written via a temp file + rename so a concurrent reader (a running
+// sync/scrub or the Setup page) never sees a half-written file.
 function sre_ini_merge($updates) {
     global $settingsIni;
     $existing = [];
@@ -58,7 +60,16 @@ function sre_ini_merge($updates) {
     $out = '';
     foreach ($existing as $k => $v) { $out .= "{$k}={$v}\n"; }
     @mkdir(dirname($settingsIni), 0755, true);
-    file_put_contents($settingsIni, $out);
+    $tmp = $settingsIni . '.tmp.' . getmypid();
+    if (@file_put_contents($tmp, $out) === false) {
+        @unlink($tmp);
+        return false;
+    }
+    if (!@rename($tmp, $settingsIni)) {
+        @unlink($tmp);
+        return false;
+    }
+    return true;
 }
 
 switch ($action) {
