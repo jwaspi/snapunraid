@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "snapunraid">
   <!ENTITY author    "jwaspi">
-  <!ENTITY version   "2026.09.28">
+  <!ENTITY version   "2026.09.29">
   <!ENTITY launch    "Settings/snapunraid">
   <!ENTITY pluginURL "https://raw.githubusercontent.com/jwaspi/snapunraid/main/snapunraid.plg">
   <!ENTITY support   "https://github.com/jwaspi/snapunraid/issues">
@@ -10,6 +10,7 @@
 <PLUGIN name="snapunraid" version="&version;" author="&author;" icon="camera"
         pluginURL="&pluginURL;" support="&support;" launch="&launch;">
   <CHANGES><![CDATA[
+2026.09.29 - Audit fixes and a test suite. (1) Lock discipline: Restore/Check now wait for any in-flight snapraid command to release its content lock like sync/scrub already did, and the Dashboard's background status-refresh also pauses during a full check, so a restore or check can no longer die with "SnapRAID is already in use!". (2) Setup: unchecking every exclude is now honored (the settings readers treated an empty value as "unset" and silently reinstated the defaults; list-like settings now use a raw reader), the saved preset checkboxes are restored instead of always rendering the defaults (including when the saved list has blank fields), and custom cron validation shares one helper. (3) Save Setup no longer reports "Saved" when settings.ini could not be written or the config/schedule failed to apply, and an invalid custom cron surfaces a visible warning instead of silently falling back to nightly. (4) Recover: "Files needing attention" now picks the most recently started detection run and reports its kind, rather than the first non-null state key, and a successful sync clears entries that were only "deleted since last sync" immediately instead of waiting for an unrelated re-check. (5) Cancellation no longer assumes setsid is installed and no longer assumes the recorded PID is a process-group leader; it falls back to signalling the process directly. (6) History logs: a bounded tail of each run log is saved to the flash so "view log" still works after a reboot wipes /var/local. (7) Misc: removed dead code, corrected the user0/pseudo-mount skip list, and used ctime for parity-age. (8) Added an offline unit-test suite (tests/run.sh) covering the label->mount mapping, problem parsing, error/block counting, empty-vs-unset settings, and metacharacter-safe settings writes.
 2026.09.28 - FIX: Recover tab path resolution and restore, bad-file counts, and settings corruption. (1) SnapRAID's error:/status: log tags carry the disk LABEL declared in snapraid.conf ("data d6 /mnt/disk4/"), not the mount name, so the old "/mnt/<label>/..." rebuild produced paths like /mnt/d6/... that don't exist, every listed size was 0, and "Restore this file" ran `snapraid fix -f <absolute path>` - which matches nothing, because --filter patterns are relative to the disk mount. Paths are now resolved through snapraid.conf, and single-file restore passes `-d <label> -f <relative path>`; a per-disk "Restore all on <disk>" button (using the previously-unreachable fix -d path) is offered when more than one disk has damage. (2) The Dashboard and scrub notification reported error BLOCKS as if they were files (a scrub flagging 115,700 blocks was really only 25 distinct files); the reported count is now the number of unique files, with the raw block count shown alongside it, and the "deleted since last sync" detection compares like with like. (3) A config value containing '&' or '|' silently corrupted settings.ini because sre_set_setting used sed, where '&' re-inserts the old match and '|' closes the s|...|...| expression; values are now written without sed, and settings.ini is written atomically (temp file + rename). (4) A full check now parses its results with one awk|sort pass instead of spawning a jq process per tag line (the same change already made for the Recover list), so a check on a degraded array no longer hangs for minutes, and check-/fix- logs are now pruned like sync/scrub logs so they can't grow without bound in RAM.
 2026.09.26 - FIX: the sync/scrub/health-check schedule did not survive a reboot. /etc/cron.d/snapunraid lives on the RAM rootfs and was only ever written when Setup was saved, so after every reboot no cron entries existed until someone reopened the plugin - the array silently ran unprotected. The event/started hook now reinstalls the schedule from settings.ini at boot. It is also shipped executable via a FILE Mode="0755" attribute, because the plugin's old top-level <RUN command="chmod ..."> never executed (Unraid's installer only processes <FILE> elements) and Unraid's emhttp_event dispatcher only runs hooks with the +x bit - so the hook had never run at all. The ignored <EVENT> tag was removed and the dead <RUN> housekeeping moved into an executable inline post-install FILE block.
 2026.09.14 - Dashboard: a scrub that only flagged files deleted since the last sync now shows a warning "Sync needed" instead of the red "Attention needed", and a successful sync automatically clears that status so the Dashboard returns to "Protected" without waiting for the next scrub. Real corruption still shows "Attention needed".
@@ -61,6 +62,10 @@ $settingsIni = '/boot/config/plugins/' . $plugin . '/settings.ini';
 // ---------------------------------------------------------------------------
 // Load current settings for pre-filling the Setup form
 // ---------------------------------------------------------------------------
+// Read a settings.ini value. A key that is present with an empty value returns
+// '' (NOT the default) - the default applies only when the key is absent. That
+// is what lets list-like settings such as EXCLUDES represent "the user cleared
+// every exclude"; scalar callers pass a sensible default for the absent case.
 function sre_ini_get($key, $default = '') {
     global $settingsIni;
     if (!file_exists($settingsIni)) return $default;
@@ -200,12 +205,12 @@ foreach ($importCandidates as $c) { if (file_exists($c)) { $importDetected = $c;
       <h3>3. Skip these (optional)</h3>
       <p class="sre-hint">Common junk / active-write locations are pre-checked. Add your own, one per line.</p>
       <div class="sre-checklist" id="sre-exclude-presets">
-        <label><input type="checkbox" value="/appdata/" class="sre-exclude-preset" checked> Docker appdata</label>
-        <label><input type="checkbox" value="/system/" class="sre-exclude-preset" checked> VM disk images (system share)</label>
-        <label><input type="checkbox" value="/domains/" class="sre-exclude-preset" checked> VM domains</label>
-        <label><input type="checkbox" value="/isos/" class="sre-exclude-preset" checked> ISOs</label>
-        <label><input type="checkbox" value="downloads/incomplete/" class="sre-exclude-preset" checked> In-progress downloads</label>
-        <label><input type="checkbox" value="*.tmp" class="sre-exclude-preset" checked> *.tmp files</label>
+        <label><input type="checkbox" value="/appdata/" class="sre-exclude-preset"> Docker appdata</label>
+        <label><input type="checkbox" value="/system/" class="sre-exclude-preset"> VM disk images (system share)</label>
+        <label><input type="checkbox" value="/domains/" class="sre-exclude-preset"> VM domains</label>
+        <label><input type="checkbox" value="/isos/" class="sre-exclude-preset"> ISOs</label>
+        <label><input type="checkbox" value="downloads/incomplete/" class="sre-exclude-preset"> In-progress downloads</label>
+        <label><input type="checkbox" value="*.tmp" class="sre-exclude-preset"> *.tmp files</label>
       </div>
       <textarea id="sre-exclude-custom" class="sre-textarea" placeholder="One extra pattern per line, e.g. *.partial"></textarea>
     </div>
@@ -385,6 +390,7 @@ const SRE_PRESELECTED_SCHEDULE = <?= json_encode($cur_schedule) ?>;
 const SRE_CUSTOM_SYNC_CRON = <?= json_encode($cur_custom_sync) ?>;
 const SRE_CUSTOM_SCRUB_CRON = <?= json_encode($cur_custom_scrub) ?>;
 const SRE_ALERTS = <?= json_encode($cur_alerts) ?>;
+const SRE_SAVED_EXCLUDES = <?= json_encode(array_values(array_filter(explode(',', $cur_excludes)))) ?>;
 const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
     array_filter(explode(',', $cur_excludes)),
     ['/appdata/', '/system/', '/domains/', '/isos/', 'downloads/incomplete/', '*.tmp']
@@ -859,7 +865,11 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
                         }
                         const content = res.content || '(no log content)';
                         const note = res.truncated
-                            ? '<div class="sre-log-note">Showing the last 200 KB of the log (full log is ' + humanBytes(res.total_bytes || 0) + ', kept on disk).</div>'
+                            ? '<div class="sre-log-note">' +
+                              (res.persisted
+                                ? 'Showing a bounded copy saved on the flash drive (the full in-memory log was cleared, e.g. by a reboot).'
+                                : 'Showing the last 200 KB of the log (full log is ' + humanBytes(res.total_bytes || 0) + ', kept on disk).') +
+                              '</div>'
                             : '';
                         const modal = document.createElement('div');
                         modal.className = 'sre-log-modal';
@@ -902,7 +912,10 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
             } else if (state.install_snapraid_status === 'running') {
                 detail.textContent = state.install_snapraid_message || 'Installing...';
                 installBtn.style.display = 'none';
-                setupBody.style.display = 'none';
+                // Show the form while installing so the user can fill it in;
+                // Save Setup is still gated server-side. Keep polling.
+                setupBody.style.display = 'block';
+                if (!installPollTimer) installPollTimer = setInterval(refreshInstallState, 3000);
             } else if (state.install_snapraid_status === 'error') {
                 detail.textContent = 'Install failed: ' + (state.install_snapraid_message || 'unknown error');
                 installBtn.textContent = 'Retry Install';
@@ -910,7 +923,15 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
                 setupBody.style.display = 'none';
                 if (installPollTimer) { clearInterval(installPollTimer); installPollTimer = null; }
             } else {
-                detail.textContent = 'SnapRAID is not installed yet.';
+                // No install attempted yet (or state unknown). The page-load
+                // kick normally starts one; if it didn't (e.g. it raced a
+                // still-in-flight install), start it here so the Setup tab
+                // doesn't dead-end, and poll.
+                if (!installPollTimer) {
+                    post('install_snapraid', {});
+                    installPollTimer = setInterval(refreshInstallState, 3000);
+                }
+                detail.textContent = 'SnapRAID is not installed yet - starting install...';
                 installBtn.textContent = 'Install SnapRAID';
                 installBtn.style.display = 'inline-block';
                 setupBody.style.display = 'none';
@@ -1025,6 +1046,15 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
 
         document.getElementById('sre-schedule-select').value = SRE_PRESELECTED_SCHEDULE || 'daily';
         document.getElementById('sre-exclude-custom').value = SRE_CUSTOM_EXCLUDES || '';
+
+        // Reflect the saved exclude presets. The server renders these unchecked
+        // by default so that "no presets" (an explicitly empty EXCLUDES) can be
+        // told apart from the pristine defaults; here we tick exactly the saved
+        // ones. When EXCLUDES has never been set, SRE_SAVED_EXCLUDES carries the
+        // default list, so a first-time visit still shows the recommended ones.
+        document.querySelectorAll('.sre-exclude-preset').forEach(cb => {
+            cb.checked = SRE_SAVED_EXCLUDES.includes(cb.value);
+        });
 
         // Custom schedule: friendly day-of-week + time pickers that generate the
         // cron, with an "Advanced" mode for typing cron directly. The pickers
@@ -1209,7 +1239,11 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
             custom_scrub_cron: customScrubCron,
             delete_threshold: threshold
         }).then(res => {
-            resultEl.textContent = res.ok ? 'Saved. Schedule installed.' : ('Error: ' + (res.error || 'unknown'));
+            if (res.ok) {
+                resultEl.textContent = res.warning ? ('Saved, but: ' + res.warning) : 'Saved. Schedule installed.';
+            } else {
+                resultEl.textContent = 'Error: ' + (res.error || 'unknown');
+            }
         });
     });
 
@@ -1507,11 +1541,25 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST' || !isset($_POST['sre_action'])) {
 
 $action = $_POST['sre_action'];
 
-// Cancel a running sync/scrub. The wrapper scripts are started with `setsid`,
-// so the PID they record in state.json is also their process-group id; a
-// `kill -TERM -- -PID` signals the whole group (wrapper + snapraid). We only
-// kill if the PID is still alive AND its command line is one of ours, so a
-// stale/recycled PID can never take down an unrelated process.
+// Process-group id of a PID, or 0 if unavailable. /proc/<pid>/stat field 5 is
+// pgrp, but the comm field (2) can contain spaces and parens, so parse from
+// after the last ')'.
+function sre_pgid_of($pid) {
+    $stat = @file_get_contents("/proc/{$pid}/stat");
+    if ($stat === false) return 0;
+    $close = strrpos($stat, ')');
+    if ($close === false) return 0;
+    $fields = preg_split('/\s+/', trim(substr($stat, $close + 1)));
+    return isset($fields[2]) ? intval($fields[2]) : 0;
+}
+
+// Cancel a running sync/scrub. The wrapper scripts re-exec under `setsid`
+// (or ajax starts them with it), so the PID they record in state.json is also
+// their process-group id; a `kill -TERM -- -PID` signals the whole group
+// (wrapper + snapraid). We only kill if the PID is still alive AND its command
+// line is one of ours, so a stale/recycled PID can never take down an unrelated
+// process. When the PID is NOT a group leader (e.g. `setsid` was unavailable
+// and the wrapper didn't re-exec), we fall back to signalling just that PID.
 function sre_cancel_operation($pidKey) {
     $stateRaw = @file_get_contents('/var/local/snapunraid/state.json');
     $stateArr = json_decode($stateRaw, true) ?: [];
@@ -1523,8 +1571,24 @@ function sre_cancel_operation($pidKey) {
     if ($cmdline === false || (strpos($cmdline, 'snapunraid') === false && strpos($cmdline, 'snapraid') === false)) {
         return ['ok' => false, 'error' => 'process not found or not ours'];
     }
-    shell_exec("kill -TERM -- -{$pid} 2>/dev/null");
+    if (sre_pgid_of($pid) === $pid) {
+        shell_exec("kill -TERM -- -{$pid} 2>/dev/null");
+    } else {
+        shell_exec("kill -TERM {$pid} 2>/dev/null");
+    }
     return ['ok' => true];
+}
+
+// Read the cron-fallback warning install_cron.sh leaves behind (e.g. the user's
+// custom cron was invalid, so we silently installed the daily default). Returns
+// '' when there is no warning. Consuming it clears the file so it is shown once.
+function sre_take_cron_warning() {
+    global $settingsIni;
+    $file = dirname($settingsIni) . '/cron-warning.txt';
+    if (!is_file($file)) return '';
+    $msg = trim(@file_get_contents($file));
+    @unlink($file);
+    return $msg;
 }
 
 // Merge key=value pairs into settings.ini, preserving any keys not being
@@ -1605,7 +1669,7 @@ switch ($action) {
         $schedule = $_POST['schedule'] ?? 'daily';
         $threshold = intval($_POST['delete_threshold'] ?? 50);
 
-        sre_ini_merge([
+        $merged = sre_ini_merge([
             'PARITY_PATH' => trim($_POST['parity_path'] ?? ''),
             'PARITY2_PATH' => trim($_POST['parity2_path'] ?? ''),
             'DATA_DISKS' => implode(',', $dataArr),
@@ -1616,12 +1680,37 @@ switch ($action) {
             'CUSTOM_SCRUB_CRON' => trim($_POST['custom_scrub_cron'] ?? ''),
             'DELETE_THRESHOLD_COUNT' => $threshold,
         ]);
+        if (!$merged) {
+            // Most likely the flash is read-only / full. Do not claim success:
+            // nothing was saved and the config was not regenerated.
+            echo json_encode(['ok' => false, 'error' => 'Could not write settings.ini on the flash drive (is it read-only or full?).']);
+            break;
+        }
 
         // regenerate snapraid.conf and (re)install the cron schedule
         $genOut = shell_exec("bash {$scriptDir}/genconfig.sh 2>&1");
         $cronOut = shell_exec("bash {$scriptDir}/install_cron.sh 2>&1");
+        $cronWarning = sre_take_cron_warning();
 
-        echo json_encode(['ok' => true, 'genconfig' => trim($genOut), 'cron' => trim($cronOut)]);
+        // install_cron.sh always prints exactly one "Installed schedule:" line
+        // on success; treat a missing line as a failure so the UI can't say
+        // "Saved" when the schedule silently didn't apply. genconfig.sh prints
+        // "OK: wrote ..." on success.
+        $genOk = (strpos($genOut, 'OK:') !== false);
+        $cronOk = (strpos($cronOut, 'Installed schedule:') !== false)
+               || (strpos($cronOut, 'Manual schedule selected') !== false);
+        if (!$genOk || !$cronOk) {
+            $detail = trim($genOk ? '' : $genOut);
+            if (!$cronOk) { $detail = trim($detail . "\n" . $cronOut); }
+            echo json_encode(['ok' => false,
+                'error' => 'Settings were written but the config/schedule could not be applied' .
+                           ($detail !== '' ? ': ' . $detail : '.'),
+                'warning' => $cronWarning]);
+            break;
+        }
+
+        echo json_encode(['ok' => true, 'warning' => $cronWarning,
+            'genconfig' => trim($genOut), 'cron' => trim($cronOut)]);
         break;
 
     case 'import_config':
@@ -1798,24 +1887,48 @@ switch ($action) {
 
     case 'get_log':
         $path = $_POST['path'] ?? '';
-        // only allow reading logs from our own log directory
-        if (preg_match('#^/var/local/snapunraid/logs/[A-Za-z0-9._-]+\.log$#', $path) && file_exists($path)) {
-            // Return only the tail of the log. Sync logs can be tens of MB of
-            // progress lines; the History tab only needs the end (summary,
-            // errors, final status). The full log stays on disk for debugging.
-            $maxBytes = 200 * 1024;
-            $size = filesize($path);
-            $offset = max(0, $size - $maxBytes);
-            $content = file_get_contents($path, false, null, $offset);
-            echo json_encode([
-                'ok' => true,
-                'content' => $content,
-                'truncated' => $size > $maxBytes,
-                'total_bytes' => $size,
-            ]);
-        } else {
-            echo json_encode(['ok' => false, 'error' => 'invalid log path']);
+        // Logs live in the tmpfs RUN_LOG dir; after a reboot only the bounded
+        // tails persisted on the flash remain. Resolve a requested tmpfs log to
+        // its persisted tail when the full log is gone, so History rows still
+        // open after a reboot. Both forms are regex-constrained (no traversal).
+        //
+        // These must match common.sh: LOG_DIR (SRE_LOG_DIR) and PERSIST_LOG_DIR
+        // (SRE_PERSIST_LOG_DIR, default <plugin home>/logs) and the '.tail'
+        // suffix written by sre_persist_log. Keep them in sync here.
+        $logDir = "/var/local/{$plugin}/logs";
+        $persistDir = "/boot/config/plugins/{$plugin}/logs";
+        $tailSuffix = '.tail';
+        $baseRe = '[A-Za-z0-9._-]+\.log';
+        $candidates = [];
+        if (preg_match('#^' . preg_quote($logDir, '#') . '/' . $baseRe . '$#', $path)) {
+            $candidates[] = $path;
+            $candidates[] = $persistDir . '/' . basename($path) . $tailSuffix;
+        } elseif (preg_match('#^' . preg_quote($persistDir, '#') . '/' . $baseRe . preg_quote($tailSuffix, '#') . '$#', $path)) {
+            $candidates[] = $path;
         }
+        $resolved = '';
+        foreach ($candidates as $c) {
+            if (is_file($c)) { $resolved = $c; break; }
+        }
+        if ($resolved === '') {
+            echo json_encode(['ok' => false, 'error' => 'invalid log path']);
+            break;
+        }
+        // Return only the tail of the log. Sync logs can be tens of MB of
+        // progress lines; the History tab only needs the end (summary, errors,
+        // final status). The full log stays on disk for debugging.
+        $maxBytes = 200 * 1024;
+        $size = filesize($resolved);
+        $offset = max(0, $size - $maxBytes);
+        $content = file_get_contents($resolved, false, null, $offset);
+        $isTail = (substr($resolved, -strlen($tailSuffix)) === $tailSuffix);
+        echo json_encode([
+            'ok' => true,
+            'content' => $content,
+            'truncated' => $size > $maxBytes || $isTail,
+            'persisted' => $isTail,
+            'total_bytes' => $size,
+        ]);
         break;
 
     default:
@@ -2005,22 +2118,46 @@ case ":${PATH}:" in
     *) export PATH="/usr/local/sbin:/usr/local/bin:${PATH}" ;;
 esac
 
-PLUGIN_HOME="/boot/config/plugins/${PLUGIN_NAME}"
-PLUGIN_VAR="/var/local/${PLUGIN_NAME}"        # runtime state (not persisted across reboot, rebuilt on start)
+PLUGIN_HOME="${SRE_PLUGIN_HOME:-/boot/config/plugins/${PLUGIN_NAME}}"
+PLUGIN_VAR="${SRE_PLUGIN_VAR:-/var/local/${PLUGIN_NAME}}"   # runtime state (not persisted across reboot, rebuilt on start)
 # Paths can be overridden via env (SRE_*) for testing without touching the
 # real plugin files.
 SETTINGS_FILE="${SRE_SETTINGS_FILE:-${PLUGIN_HOME}/settings.ini}"
 SNAPRAID_CONF="${SRE_SNAPRAID_CONF:-${PLUGIN_HOME}/snapraid.conf}"
 STATE_FILE="${SRE_STATE_FILE:-${PLUGIN_VAR}/state.json}"
 LOG_DIR="${SRE_LOG_DIR:-${PLUGIN_VAR}/logs}"
+# Bounded tails of the tmpfs logs are copied here (flash) so History rows still
+# have a log to show after a reboot wipes LOG_DIR.
+PERSIST_LOG_DIR="${SRE_PERSIST_LOG_DIR:-${PLUGIN_HOME}/logs}"
 HISTORY_FILE="${SRE_HISTORY_FILE:-${PLUGIN_HOME}/history.jsonl}"   # persistent append-only run history (not wiped on uninstall)
-LOCK_FILE="/var/lock/${PLUGIN_NAME}.lock"
+LOCK_FILE="${SRE_LOCK_FILE:-/var/lock/${PLUGIN_NAME}.lock}"
 
-mkdir -p "$PLUGIN_HOME" "$PLUGIN_VAR" "$LOG_DIR"
+mkdir -p "$PLUGIN_HOME" "$PLUGIN_VAR" "$LOG_DIR" "$PERSIST_LOG_DIR"
 
 # ---------------------------------------------------------------------------
 # Settings are stored as simple KEY=VALUE pairs in settings.ini
+#
+# sre_get_setting treats an empty value as "unset" and returns the default.
+# That is right for scalars (a blank threshold should fall back), but WRONG for
+# list-like settings where an empty value is a deliberate user choice (e.g.
+# unchecking every exclude). Those callers use sre_get_setting_raw, which
+# distinguishes "key absent" from "key present but empty".
 # ---------------------------------------------------------------------------
+sre_get_setting_raw() {
+    local key="$1"
+    local default="$2"
+    if [[ -f "$SETTINGS_FILE" ]]; then
+        local line val
+        line=$(grep -E "^${key}=" "$SETTINGS_FILE" | tail -1)
+        if [[ -n "$line" ]]; then
+            val="${line#*=}"
+            echo "$val"
+            return
+        fi
+    fi
+    echo "$default"
+}
+
 sre_get_setting() {
     local key="$1"
     local default="$2"
@@ -2344,12 +2481,26 @@ sre_resolve_problem_paths() {
 # HISTORY_MAX. Used by the History tab.
 # ---------------------------------------------------------------------------
 HISTORY_MAX=100
+PERSIST_LOG_MAX=100     # newest N log tails kept on flash
+PERSIST_TAIL_KIB=64     # size cap per persisted tail
+
+# Copy a bounded tail of a run log to the flash so the History tab still has a
+# log to show after a reboot wipes the tmpfs RUN_LOG dir. LOG_DIR is tmpfs;
+# without this, every History row's "view log" fails after a reboot.
+sre_persist_log() {
+    local logfile="$1"
+    [[ -n "$logfile" && -f "$logfile" ]] || return 0
+    mkdir -p "$PERSIST_LOG_DIR"
+    local base; base=$(basename "$logfile")
+    tail -c $((PERSIST_TAIL_KIB * 1024)) "$logfile" > "${PERSIST_LOG_DIR}/${base}.tail" 2>/dev/null || return 0
+    ls -1t "${PERSIST_LOG_DIR}"/*.tail 2>/dev/null | tail -n +$((PERSIST_LOG_MAX + 1)) | xargs -r rm -f
+}
 
 sre_append_history() {
     # sre_append_history type status [field value]...
     # Builds and appends a record with a timestamp; prunes to newest HISTORY_MAX.
     local type="$1"; local status="$2"; shift 2
-    local ts json rec
+    local ts json rec logpath=""
 
     ts=$(date +%s)
     json=$(jq -cn --arg type "$type" --arg status "$status" --argjson ts "$ts" \
@@ -2358,6 +2509,7 @@ sre_append_history() {
 
     # merge extra field/value pairs (strings safely)
     while [[ $# -ge 2 ]]; do
+        [[ "$1" == "log" ]] && logpath="$2"
         json=$(jq -cn --argjson o "$json" --arg k "$1" --arg v "$2" \
             '$o + {($k):$v}' 2>/dev/null)
         shift 2
@@ -2366,6 +2518,10 @@ sre_append_history() {
 
     mkdir -p "$(dirname "$HISTORY_FILE")"
     echo "$json" >> "$HISTORY_FILE"
+
+    # Keep a bounded tail of the run log on the flash so it survives a reboot
+    # (the full log stays in tmpfs and is intentionally not persisted).
+    [[ -n "$logpath" ]] && sre_persist_log "$logpath"
 
     # prune to newest HISTORY_MAX lines
     local tmp; tmp=$(mktemp)
@@ -2381,6 +2537,42 @@ sre_read_history() {
     fi
     # each line is already JSON; wrap in an array and reverse to newest-first
     jq -cn '[inputs] | reverse' "$HISTORY_FILE" 2>/dev/null || jq -cn '[ ]' 2>/dev/null
+}
+
+# Pick the log whose problem list is most current, for the Recover tab.
+#
+# A fix's output is NOT a problem source, and a later command can have already
+# cleared an earlier one (a successful sync makes previous "deleted since last
+# sync" scrub errors moot). So among the detection logs (check, then scrub,
+# then sync) choose the most RECENTLY STARTED run, using the *_started epochs
+# that are always written. The old `.check_last_log // .scrub_last_log //
+# .sync_last_log` chain returned the first non-null key regardless of time
+# (jq's // only skips null/false), so a stale check log could shadow a newer
+# scrub indefinitely. Falls back to the old behaviour when no timestamps exist.
+#
+# Prints "<kind>\t<logpath>" so the caller knows WHICH run won (a path alone is
+# ambiguous when runs share a log path) without re-deriving it. Outputs an empty
+# line when nothing is configured.
+sre_latest_problem_log() {
+    local check scrub sync ts_check ts_scrub ts_sync
+    check=$(jq -r '.check_last_log // ""' "$STATE_FILE" 2>/dev/null)
+    scrub=$(jq -r '.scrub_last_log // ""' "$STATE_FILE" 2>/dev/null)
+    sync=$(jq -r '.sync_last_log // ""' "$STATE_FILE" 2>/dev/null)
+    ts_check=$(jq -r '.check_started // 0' "$STATE_FILE" 2>/dev/null)
+    ts_scrub=$(jq -r '.scrub_started // 0' "$STATE_FILE" 2>/dev/null)
+    ts_sync=$(jq -r '.sync_started // 0' "$STATE_FILE" 2>/dev/null)
+    ts_check=${ts_check:-0}; ts_scrub=${ts_scrub:-0}; ts_sync=${ts_sync:-0}
+
+    local best="" best_kind="" best_ts=-1
+    # First non-empty candidate always wins ties; later candidates need a
+    # STRICTLY newer start time, so with no timestamps we keep the documented
+    # check > scrub > sync precedence.
+    if [[ -n "$check" && ( -z "$best" || "$ts_check" -ge "$best_ts" ) ]]; then best="$check"; best_kind="check"; best_ts="$ts_check"; fi
+    if [[ -n "$scrub" && ( -z "$best" || "$ts_scrub" -gt "$best_ts" ) ]]; then best="$scrub"; best_kind="scrub"; best_ts="$ts_scrub"; fi
+    if [[ -n "$sync"  && ( -z "$best" || "$ts_sync"  -gt "$best_ts" ) ]]; then best="$sync";  best_kind="sync";  best_ts="$ts_sync";  fi
+    if [[ -n "$best" ]]; then
+        printf '%s\t%s\n' "$best_kind" "$best"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -2437,16 +2629,17 @@ sre_duration() {
     fi
 }
 
-sre_log_missing_count() {
-    # Count errors in a scrub/check log that are "Open error. No such file or
-    # directory." - blocks of files that were deleted or renamed since the last
-    # sync. Expected after legitimate changes, NOT corruption; the remedy is a
-    # sync, not a restore (restoring would resurrect the deleted files).
-    # The disk token can be a generated label (d1, d6) or an imported name with
-    # '-' or '_', so don't constrain it to alphanumerics. Only the trailing
-    # message is anchored, and a ':' in the path can't be confused with the
-    # message because the message itself contains a literal '.' and spaces.
-    grep -cE '^error:[0-9]+:[^:]+:.*Open error\. No such file or directory\.' "$1" 2>/dev/null
+# ---------------------------------------------------------------------------
+# Validate a 5-field cron expression (minute hour day-of-month month day-of-week).
+# Shared by install_cron.sh (to reject bad custom cron) and tests.
+# ---------------------------------------------------------------------------
+sre_valid_cron() {
+    local fields f
+    IFS=' ' read -ra fields <<< "$1"
+    [[ ${#fields[@]} -eq 5 ]] || return 1
+    for f in "${fields[@]}"; do
+        [[ -n "$f" && "$f" =~ ^[0-9*/,-]+$ ]] || return 1
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -2566,6 +2759,22 @@ sre_lock() {
     flock -n 200 || { echo "Another SnapUnraid operation is already running."; exit 1; }
 }
 
+# Run this wrapper as its own session/process-group leader so the webGUI can
+# cancel it by signalling the whole group (wrapper + running snapraid). The
+# webGUI starts jobs with `setsid`, but cron does not, so sync.sh/scrub.sh/
+# recover.sh check re-exec here. `setsid` is NOT guaranteed on every Unraid
+# build (it lives in util-linux); if it is unavailable we fall back to a
+# normal run - cancellation still works, it just signals the wrapper only.
+sre_ensure_group_leader() {
+    local pgid
+    pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+    [[ "$pgid" == "$$" ]] && return 0
+    if command -v setsid >/dev/null 2>&1; then
+        exec setsid bash "$0" "$@"
+    fi
+    return 0
+}
+
 # Wait for any in-flight snapraid command to release its content lock.
 # snapraid takes an exclusive lock for EVERY command, so a Dashboard
 # status-refresh (`snapraid status`, kicked off by a page load) that is still
@@ -2575,11 +2784,26 @@ sre_lock() {
 # no snapraid process and no status-refresh is alive, up to $1 seconds
 # (default 120). Returns non-zero if still busy after the timeout - callers
 # proceed anyway, since the snapraid lock error will then surface normally.
+#
+# Our own process and its ancestors are ignored when matching: a caller whose
+# command line merely CONTAINS "snapraid" (a wrapper invoking a plugin script)
+# must not be mistaken for a running snapraid and deadlock the wait.
 sre_wait_snapraid() {
     local timeout_s="${1:-120}" waited=0
+    local self_pids="" p
+    p=$$
+    while [[ -n "$p" && "$p" != "0" ]]; do
+        self_pids+=" $p"
+        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    done
     while (( waited < timeout_s )); do
-        if ! pgrep -x snapraid >/dev/null 2>&1 \
-           && ! pgrep -f 'status.sh status-refresh' >/dev/null 2>&1; then
+        local busy=0
+        for p in $(pgrep -x snapraid 2>/dev/null); do
+            [[ " $self_pids " == *" $p "* ]] && continue
+            busy=1
+            break
+        done
+        if [[ $busy -eq 0 ]] && ! pgrep -f 'status.sh status-refresh' >/dev/null 2>&1; then
             return 0
         fi
         sleep 2
@@ -2610,7 +2834,7 @@ source "${SCRIPT_DIR}/common.sh"
 PARITY_PATH=$(sre_get_setting "PARITY_PATH" "")
 PARITY2_PATH=$(sre_get_setting "PARITY2_PATH" "")
 DATA_DISKS=$(sre_get_setting "DATA_DISKS" "")
-EXCLUDES=$(sre_get_setting "EXCLUDES" "*.tmp,*.bak,/appdata/,/system/,/domains/,/isos/,downloads/incomplete/")
+EXCLUDES=$(sre_get_setting_raw "EXCLUDES" "*.tmp,*.bak,/appdata/,/system/,/domains/,/isos/,downloads/incomplete/")
 CONTENT_DISKS=$(sre_get_setting "CONTENT_DISKS" "")
 
 if [[ -z "$PARITY_PATH" || -z "$DATA_DISKS" ]]; then
@@ -2715,18 +2939,12 @@ echo "OK: wrote ${SNAPRAID_CONF}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
 
-CRON_FILE="/etc/cron.d/snapunraid"
+CRON_FILE="${SRE_CRON_FILE:-/etc/cron.d/snapunraid}"
 SCHEDULE=$(sre_get_setting "SCHEDULE" "daily")
-
-# Validate a 5-field cron expression (minute hour day-of-month month day-of-week).
-sre_valid_cron() {
-    local fields f
-    IFS=' ' read -ra fields <<< "$1"
-    [[ ${#fields[@]} -eq 5 ]] || return 1
-    for f in "${fields[@]}"; do
-        [[ "$f" =~ ^[0-9*/,-]+$ ]] || return 1
-    done
-}
+# Written when a custom cron is rejected so the Setup tab can warn the user that
+# their schedule did not apply (the script's own output is otherwise swallowed).
+WARN_FILE="${SRE_WARN_FILE:-${PLUGIN_HOME}/cron-warning.txt}"
+rm -f "$WARN_FILE"
 
 case "$SCHEDULE" in
     daily)
@@ -2753,6 +2971,8 @@ case "$SCHEDULE" in
         SCRUB_CRON=$(sre_get_setting "CUSTOM_SCRUB_CRON" "0 4 * * 0")
         if ! sre_valid_cron "$SYNC_CRON" || ! sre_valid_cron "$SCRUB_CRON"; then
             echo "WARNING: invalid custom cron expression(s) - falling back to daily sync + weekly scrub."
+            printf 'Custom schedule was not applied: sync="%s", scrub="%s" is not a valid 5-field cron expression (minute hour day-of-month month day-of-week). Using nightly sync + weekly scrub instead.\n' \
+                "$SYNC_CRON" "$SCRUB_CRON" > "$WARN_FILE"
             SYNC_CRON="30 3 * * *"
             SCRUB_CRON="0 4 * * 0"
         fi
@@ -3098,16 +3318,35 @@ case "$ACTION" in
         # snapraid.conf as /mnt/disk4, so /mnt/d6 would be wrong) and preserves
         # paths containing ':'.
         #
+        # The log chosen is NOT simply the newest completed one: a fix's output
+        # is not a problem source, and a later sync can moot earlier "deleted
+        # since last sync" scrub errors. sre_latest_problem_log picks the most
+        # recently STARTED detection run and returns "<kind>\t<log>"; when the
+        # kind is sync the "missing" rows it just resolved are suppressed.
+        # Without that, a sync would not clear stale deleted-file entries until
+        # an unrelated re-check.
+        #
         # Deduplication and parsing are done with one awk|sort pass, NOT
         # per-line jq: a scrub with 100k+ error blocks (e.g. every block of
         # deleted files) would spawn a process per line and take minutes. One
         # jq call at the end builds the JSON array.
-        state=$(sre_read_state_json)
-        log=$(jq -r '.check_last_log // .scrub_last_log // .sync_last_log // ""' <<<"$state" 2>/dev/null)
+        selection=$(sre_latest_problem_log)
+        log_kind="${selection%%$'\t'*}"
+        log="${selection#*$'\t'}"
+        [[ "$selection" == *$'\t'* ]] || { log_kind=""; log=""; }
         if [[ -n "$log" && -f "$log" ]]; then
-            sre_parse_problem_tags "$log" | sre_resolve_problem_paths \
-                | jq -R -c 'split("\t") | {disk: .[0], path: .[1], reason: .[2], size: (.[3] | tonumber)}' \
-                | jq -c -s 'if length == 0 then [] else . end'
+            if [[ "$log_kind" == "sync" ]]; then
+                # A successful sync has just refreshed parity, so any "missing"
+                # (deleted-since-last-sync) entries are resolved; only real
+                # corruption from the sync's own scan is a problem.
+                sre_parse_problem_tags "$log" | awk -F'\t' '$3 != "missing"' | sre_resolve_problem_paths \
+                    | jq -R -c 'split("\t") | {disk: .[0], path: .[1], reason: .[2], size: (.[3] | tonumber)}' \
+                    | jq -c -s 'if length == 0 then [] else . end'
+            else
+                sre_parse_problem_tags "$log" | sre_resolve_problem_paths \
+                    | jq -R -c 'split("\t") | {disk: .[0], path: .[1], reason: .[2], size: (.[3] | tonumber)}' \
+                    | jq -c -s 'if length == 0 then [] else . end'
+            fi
         else
             echo "[]"
         fi
@@ -3116,9 +3355,7 @@ case "$ACTION" in
         # Full array check (errors only). Runs in the background (setsid) so
         # the webGUI can poll progress and cancel it. Parses the status: tags
         # into check_problems in state.json for the Recover tab.
-        if [[ "$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')" != "$$" ]]; then
-            exec setsid bash "$0" "$@"
-        fi
+        sre_ensure_group_leader "$@"
         sre_lock
         LOGFILE=$(sre_log_start "check")
         sre_write_state "check_status" "running" "check_started" "$(date +%s)"
@@ -3174,6 +3411,10 @@ case "$ACTION" in
             exit 1
         fi
         sre_lock
+        # Give any in-flight snapraid command (a Dashboard status-refresh, or
+        # another of our own runs) time to release snapraid's exclusive content
+        # lock first - otherwise the fix dies instantly with "already in use".
+        sre_wait_snapraid 120
         LOGFILE=$(sre_log_start "fix")
         snapraid --conf "$SNAPRAID_CONF" fix -d "$ARG" >> "$LOGFILE" 2>&1
         RC=$?
@@ -3204,6 +3445,7 @@ case "$ACTION" in
         DISK_LABEL="${SPLIT%%$'\t'*}"
         DISK_REL="${SPLIT#*$'\t'}"
         sre_lock
+        sre_wait_snapraid 120
         LOGFILE=$(sre_log_start "fix")
         snapraid --conf "$SNAPRAID_CONF" fix -d "$DISK_LABEL" -f "$DISK_REL" >> "$LOGFILE" 2>&1
         RC=$?
@@ -3217,6 +3459,7 @@ case "$ACTION" in
         ;;
     fix-all)
         sre_lock
+        sre_wait_snapraid 120
         LOGFILE=$(sre_log_start "fix")
         snapraid --conf "$SNAPRAID_CONF" fix >> "$LOGFILE" 2>&1
         RC=$?
@@ -3355,9 +3598,7 @@ source "${SCRIPT_DIR}/common.sh"
 # Ensure we run as a process-group leader so the webGUI can cancel us by
 # signalling the whole group. The webGUI starts us with `setsid`, but cron
 # does not - re-exec under setsid when we're not already a group leader.
-if [[ "$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')" != "$$" ]]; then
-    exec setsid bash "$0" "$@"
-fi
+sre_ensure_group_leader "$@"
 
 sre_lock
 
@@ -3501,7 +3742,9 @@ case "$ACTION" in
         # unformatted SnapRAID parity disk. Pure bash + jq (python3 is not
         # guaranteed present on Unraid).
         disks_json="[]"
-        skip=" user user0 disks remotes rootshare cache "
+        # Pseudo-/aggregate mounts to ignore. user0 (the fused user share) is
+        # matched by the disk* branch below; there is no plain "user" mount.
+        skip=" disks remotes rootshare cache "
 
         # 1) Mounted array/pool disks under /mnt (potential data disks).
         for entry in /mnt/*; do
@@ -3609,7 +3852,7 @@ case "$ACTION" in
         # with "SnapRAID is already in use!" while a sync/scrub holds it. Skip
         # the refresh then (keeping the last good cache) instead of clobbering
         # the Dashboard's file count with zeros.
-        RUNNING=$(jq -r 'if .sync_status == "running" or .scrub_status == "running" then 1 else 0 end' "$STATE_FILE" 2>/dev/null)
+        RUNNING=$(jq -r 'if .sync_status == "running" or .scrub_status == "running" or .check_status == "running" then 1 else 0 end' "$STATE_FILE" 2>/dev/null)
         if [[ "$RUNNING" == "1" ]]; then
             exit 0
         fi
@@ -3636,7 +3879,10 @@ case "$ACTION" in
         PARITY_FILE="/mnt/${PARITY_PATH}/snapraid.parity"
         PARITY_AGE=""
         if [[ -f "$PARITY_FILE" ]]; then
-            PARITY_AGE=$(( ($(date +%s) - $(stat -c %Y "$PARITY_FILE")) / 86400 ))
+            # %Z (ctime) rather than %Y (mtime): snapraid rewrites parity via a
+            # temp file + rename, so the inode's change time is the more accurate
+            # "parity was written" moment.
+            PARITY_AGE=$(( ($(date +%s) - $(stat -c %Z "$PARITY_FILE")) / 86400 ))
         fi
 
         # Second parity disk (optional) - same freshness measure.
@@ -3645,7 +3891,7 @@ case "$ACTION" in
         if [[ -n "$PARITY2_PATH" ]]; then
             PARITY2_FILE="/mnt/${PARITY2_PATH}/snapraid.parity-2"
             if [[ -f "$PARITY2_FILE" ]]; then
-                PARITY2_AGE=$(( ($(date +%s) - $(stat -c %Y "$PARITY2_FILE")) / 86400 ))
+                PARITY2_AGE=$(( ($(date +%s) - $(stat -c %Z "$PARITY2_FILE")) / 86400 ))
             fi
         fi
 
@@ -3689,9 +3935,7 @@ source "${SCRIPT_DIR}/common.sh"
 # Ensure we run as a process-group leader so the webGUI can cancel us by
 # signalling the whole group. The webGUI starts us with `setsid`, but cron
 # does not - re-exec under setsid when we're not already a group leader.
-if [[ "$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')" != "$$" ]]; then
-    exec setsid bash "$0" "$@"
-fi
+sre_ensure_group_leader "$@"
 
 FORCE=0
 [[ "$1" == "--force" ]] && FORCE=1
@@ -4005,7 +4249,9 @@ exit $SYNC_RC
 # persisted binary already exists on flash; saving Setup runs
 # install_cron.sh).
 #
-SCRIPT_DIR="/usr/local/emhttp/plugins/snapunraid/scripts"
+# Derive SCRIPT_DIR from this file's own location so the hook keeps working if
+# the plugin is ever installed under a different name/dir.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts" && pwd)"
 
 # The redirect below can't write if this dir doesn't exist yet (install_snapraid.sh
 # creates it via common.sh, but that happens only after the redirect opens).

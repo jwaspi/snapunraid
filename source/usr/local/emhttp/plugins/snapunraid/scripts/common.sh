@@ -16,22 +16,46 @@ case ":${PATH}:" in
     *) export PATH="/usr/local/sbin:/usr/local/bin:${PATH}" ;;
 esac
 
-PLUGIN_HOME="/boot/config/plugins/${PLUGIN_NAME}"
-PLUGIN_VAR="/var/local/${PLUGIN_NAME}"        # runtime state (not persisted across reboot, rebuilt on start)
+PLUGIN_HOME="${SRE_PLUGIN_HOME:-/boot/config/plugins/${PLUGIN_NAME}}"
+PLUGIN_VAR="${SRE_PLUGIN_VAR:-/var/local/${PLUGIN_NAME}}"   # runtime state (not persisted across reboot, rebuilt on start)
 # Paths can be overridden via env (SRE_*) for testing without touching the
 # real plugin files.
 SETTINGS_FILE="${SRE_SETTINGS_FILE:-${PLUGIN_HOME}/settings.ini}"
 SNAPRAID_CONF="${SRE_SNAPRAID_CONF:-${PLUGIN_HOME}/snapraid.conf}"
 STATE_FILE="${SRE_STATE_FILE:-${PLUGIN_VAR}/state.json}"
 LOG_DIR="${SRE_LOG_DIR:-${PLUGIN_VAR}/logs}"
+# Bounded tails of the tmpfs logs are copied here (flash) so History rows still
+# have a log to show after a reboot wipes LOG_DIR.
+PERSIST_LOG_DIR="${SRE_PERSIST_LOG_DIR:-${PLUGIN_HOME}/logs}"
 HISTORY_FILE="${SRE_HISTORY_FILE:-${PLUGIN_HOME}/history.jsonl}"   # persistent append-only run history (not wiped on uninstall)
-LOCK_FILE="/var/lock/${PLUGIN_NAME}.lock"
+LOCK_FILE="${SRE_LOCK_FILE:-/var/lock/${PLUGIN_NAME}.lock}"
 
-mkdir -p "$PLUGIN_HOME" "$PLUGIN_VAR" "$LOG_DIR"
+mkdir -p "$PLUGIN_HOME" "$PLUGIN_VAR" "$LOG_DIR" "$PERSIST_LOG_DIR"
 
 # ---------------------------------------------------------------------------
 # Settings are stored as simple KEY=VALUE pairs in settings.ini
+#
+# sre_get_setting treats an empty value as "unset" and returns the default.
+# That is right for scalars (a blank threshold should fall back), but WRONG for
+# list-like settings where an empty value is a deliberate user choice (e.g.
+# unchecking every exclude). Those callers use sre_get_setting_raw, which
+# distinguishes "key absent" from "key present but empty".
 # ---------------------------------------------------------------------------
+sre_get_setting_raw() {
+    local key="$1"
+    local default="$2"
+    if [[ -f "$SETTINGS_FILE" ]]; then
+        local line val
+        line=$(grep -E "^${key}=" "$SETTINGS_FILE" | tail -1)
+        if [[ -n "$line" ]]; then
+            val="${line#*=}"
+            echo "$val"
+            return
+        fi
+    fi
+    echo "$default"
+}
+
 sre_get_setting() {
     local key="$1"
     local default="$2"
@@ -355,12 +379,26 @@ sre_resolve_problem_paths() {
 # HISTORY_MAX. Used by the History tab.
 # ---------------------------------------------------------------------------
 HISTORY_MAX=100
+PERSIST_LOG_MAX=100     # newest N log tails kept on flash
+PERSIST_TAIL_KIB=64     # size cap per persisted tail
+
+# Copy a bounded tail of a run log to the flash so the History tab still has a
+# log to show after a reboot wipes the tmpfs RUN_LOG dir. LOG_DIR is tmpfs;
+# without this, every History row's "view log" fails after a reboot.
+sre_persist_log() {
+    local logfile="$1"
+    [[ -n "$logfile" && -f "$logfile" ]] || return 0
+    mkdir -p "$PERSIST_LOG_DIR"
+    local base; base=$(basename "$logfile")
+    tail -c $((PERSIST_TAIL_KIB * 1024)) "$logfile" > "${PERSIST_LOG_DIR}/${base}.tail" 2>/dev/null || return 0
+    ls -1t "${PERSIST_LOG_DIR}"/*.tail 2>/dev/null | tail -n +$((PERSIST_LOG_MAX + 1)) | xargs -r rm -f
+}
 
 sre_append_history() {
     # sre_append_history type status [field value]...
     # Builds and appends a record with a timestamp; prunes to newest HISTORY_MAX.
     local type="$1"; local status="$2"; shift 2
-    local ts json rec
+    local ts json rec logpath=""
 
     ts=$(date +%s)
     json=$(jq -cn --arg type "$type" --arg status "$status" --argjson ts "$ts" \
@@ -369,6 +407,7 @@ sre_append_history() {
 
     # merge extra field/value pairs (strings safely)
     while [[ $# -ge 2 ]]; do
+        [[ "$1" == "log" ]] && logpath="$2"
         json=$(jq -cn --argjson o "$json" --arg k "$1" --arg v "$2" \
             '$o + {($k):$v}' 2>/dev/null)
         shift 2
@@ -377,6 +416,10 @@ sre_append_history() {
 
     mkdir -p "$(dirname "$HISTORY_FILE")"
     echo "$json" >> "$HISTORY_FILE"
+
+    # Keep a bounded tail of the run log on the flash so it survives a reboot
+    # (the full log stays in tmpfs and is intentionally not persisted).
+    [[ -n "$logpath" ]] && sre_persist_log "$logpath"
 
     # prune to newest HISTORY_MAX lines
     local tmp; tmp=$(mktemp)
@@ -392,6 +435,42 @@ sre_read_history() {
     fi
     # each line is already JSON; wrap in an array and reverse to newest-first
     jq -cn '[inputs] | reverse' "$HISTORY_FILE" 2>/dev/null || jq -cn '[ ]' 2>/dev/null
+}
+
+# Pick the log whose problem list is most current, for the Recover tab.
+#
+# A fix's output is NOT a problem source, and a later command can have already
+# cleared an earlier one (a successful sync makes previous "deleted since last
+# sync" scrub errors moot). So among the detection logs (check, then scrub,
+# then sync) choose the most RECENTLY STARTED run, using the *_started epochs
+# that are always written. The old `.check_last_log // .scrub_last_log //
+# .sync_last_log` chain returned the first non-null key regardless of time
+# (jq's // only skips null/false), so a stale check log could shadow a newer
+# scrub indefinitely. Falls back to the old behaviour when no timestamps exist.
+#
+# Prints "<kind>\t<logpath>" so the caller knows WHICH run won (a path alone is
+# ambiguous when runs share a log path) without re-deriving it. Outputs an empty
+# line when nothing is configured.
+sre_latest_problem_log() {
+    local check scrub sync ts_check ts_scrub ts_sync
+    check=$(jq -r '.check_last_log // ""' "$STATE_FILE" 2>/dev/null)
+    scrub=$(jq -r '.scrub_last_log // ""' "$STATE_FILE" 2>/dev/null)
+    sync=$(jq -r '.sync_last_log // ""' "$STATE_FILE" 2>/dev/null)
+    ts_check=$(jq -r '.check_started // 0' "$STATE_FILE" 2>/dev/null)
+    ts_scrub=$(jq -r '.scrub_started // 0' "$STATE_FILE" 2>/dev/null)
+    ts_sync=$(jq -r '.sync_started // 0' "$STATE_FILE" 2>/dev/null)
+    ts_check=${ts_check:-0}; ts_scrub=${ts_scrub:-0}; ts_sync=${ts_sync:-0}
+
+    local best="" best_kind="" best_ts=-1
+    # First non-empty candidate always wins ties; later candidates need a
+    # STRICTLY newer start time, so with no timestamps we keep the documented
+    # check > scrub > sync precedence.
+    if [[ -n "$check" && ( -z "$best" || "$ts_check" -ge "$best_ts" ) ]]; then best="$check"; best_kind="check"; best_ts="$ts_check"; fi
+    if [[ -n "$scrub" && ( -z "$best" || "$ts_scrub" -gt "$best_ts" ) ]]; then best="$scrub"; best_kind="scrub"; best_ts="$ts_scrub"; fi
+    if [[ -n "$sync"  && ( -z "$best" || "$ts_sync"  -gt "$best_ts" ) ]]; then best="$sync";  best_kind="sync";  best_ts="$ts_sync";  fi
+    if [[ -n "$best" ]]; then
+        printf '%s\t%s\n' "$best_kind" "$best"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -448,16 +527,17 @@ sre_duration() {
     fi
 }
 
-sre_log_missing_count() {
-    # Count errors in a scrub/check log that are "Open error. No such file or
-    # directory." - blocks of files that were deleted or renamed since the last
-    # sync. Expected after legitimate changes, NOT corruption; the remedy is a
-    # sync, not a restore (restoring would resurrect the deleted files).
-    # The disk token can be a generated label (d1, d6) or an imported name with
-    # '-' or '_', so don't constrain it to alphanumerics. Only the trailing
-    # message is anchored, and a ':' in the path can't be confused with the
-    # message because the message itself contains a literal '.' and spaces.
-    grep -cE '^error:[0-9]+:[^:]+:.*Open error\. No such file or directory\.' "$1" 2>/dev/null
+# ---------------------------------------------------------------------------
+# Validate a 5-field cron expression (minute hour day-of-month month day-of-week).
+# Shared by install_cron.sh (to reject bad custom cron) and tests.
+# ---------------------------------------------------------------------------
+sre_valid_cron() {
+    local fields f
+    IFS=' ' read -ra fields <<< "$1"
+    [[ ${#fields[@]} -eq 5 ]] || return 1
+    for f in "${fields[@]}"; do
+        [[ -n "$f" && "$f" =~ ^[0-9*/,-]+$ ]] || return 1
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -577,6 +657,22 @@ sre_lock() {
     flock -n 200 || { echo "Another SnapUnraid operation is already running."; exit 1; }
 }
 
+# Run this wrapper as its own session/process-group leader so the webGUI can
+# cancel it by signalling the whole group (wrapper + running snapraid). The
+# webGUI starts jobs with `setsid`, but cron does not, so sync.sh/scrub.sh/
+# recover.sh check re-exec here. `setsid` is NOT guaranteed on every Unraid
+# build (it lives in util-linux); if it is unavailable we fall back to a
+# normal run - cancellation still works, it just signals the wrapper only.
+sre_ensure_group_leader() {
+    local pgid
+    pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+    [[ "$pgid" == "$$" ]] && return 0
+    if command -v setsid >/dev/null 2>&1; then
+        exec setsid bash "$0" "$@"
+    fi
+    return 0
+}
+
 # Wait for any in-flight snapraid command to release its content lock.
 # snapraid takes an exclusive lock for EVERY command, so a Dashboard
 # status-refresh (`snapraid status`, kicked off by a page load) that is still
@@ -586,11 +682,26 @@ sre_lock() {
 # no snapraid process and no status-refresh is alive, up to $1 seconds
 # (default 120). Returns non-zero if still busy after the timeout - callers
 # proceed anyway, since the snapraid lock error will then surface normally.
+#
+# Our own process and its ancestors are ignored when matching: a caller whose
+# command line merely CONTAINS "snapraid" (a wrapper invoking a plugin script)
+# must not be mistaken for a running snapraid and deadlock the wait.
 sre_wait_snapraid() {
     local timeout_s="${1:-120}" waited=0
+    local self_pids="" p
+    p=$$
+    while [[ -n "$p" && "$p" != "0" ]]; do
+        self_pids+=" $p"
+        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    done
     while (( waited < timeout_s )); do
-        if ! pgrep -x snapraid >/dev/null 2>&1 \
-           && ! pgrep -f 'status.sh status-refresh' >/dev/null 2>&1; then
+        local busy=0
+        for p in $(pgrep -x snapraid 2>/dev/null); do
+            [[ " $self_pids " == *" $p "* ]] && continue
+            busy=1
+            break
+        done
+        if [[ $busy -eq 0 ]] && ! pgrep -f 'status.sh status-refresh' >/dev/null 2>&1; then
             return 0
         fi
         sleep 2

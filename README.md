@@ -52,6 +52,9 @@ php build/sync_plg.php
 
 # verify snapunraid.plg matches source/
 php build/verify_plg.php
+
+# offline unit tests for the shell helpers (no /boot or snapraid access)
+bash tests/run.sh
 ```
 
 ## Notes

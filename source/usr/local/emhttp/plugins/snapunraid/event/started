@@ -22,7 +22,9 @@
 # persisted binary already exists on flash; saving Setup runs
 # install_cron.sh).
 #
-SCRIPT_DIR="/usr/local/emhttp/plugins/snapunraid/scripts"
+# Derive SCRIPT_DIR from this file's own location so the hook keeps working if
+# the plugin is ever installed under a different name/dir.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts" && pwd)"
 
 # The redirect below can't write if this dir doesn't exist yet (install_snapraid.sh
 # creates it via common.sh, but that happens only after the redirect opens).

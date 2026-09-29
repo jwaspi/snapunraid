@@ -15,7 +15,7 @@ source "${SCRIPT_DIR}/common.sh"
 PARITY_PATH=$(sre_get_setting "PARITY_PATH" "")
 PARITY2_PATH=$(sre_get_setting "PARITY2_PATH" "")
 DATA_DISKS=$(sre_get_setting "DATA_DISKS" "")
-EXCLUDES=$(sre_get_setting "EXCLUDES" "*.tmp,*.bak,/appdata/,/system/,/domains/,/isos/,downloads/incomplete/")
+EXCLUDES=$(sre_get_setting_raw "EXCLUDES" "*.tmp,*.bak,/appdata/,/system/,/domains/,/isos/,downloads/incomplete/")
 CONTENT_DISKS=$(sre_get_setting "CONTENT_DISKS" "")
 
 if [[ -z "$PARITY_PATH" || -z "$DATA_DISKS" ]]; then

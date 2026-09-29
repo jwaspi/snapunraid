@@ -291,7 +291,11 @@
                         }
                         const content = res.content || '(no log content)';
                         const note = res.truncated
-                            ? '<div class="sre-log-note">Showing the last 200 KB of the log (full log is ' + humanBytes(res.total_bytes || 0) + ', kept on disk).</div>'
+                            ? '<div class="sre-log-note">' +
+                              (res.persisted
+                                ? 'Showing a bounded copy saved on the flash drive (the full in-memory log was cleared, e.g. by a reboot).'
+                                : 'Showing the last 200 KB of the log (full log is ' + humanBytes(res.total_bytes || 0) + ', kept on disk).') +
+                              '</div>'
                             : '';
                         const modal = document.createElement('div');
                         modal.className = 'sre-log-modal';
@@ -334,7 +338,10 @@
             } else if (state.install_snapraid_status === 'running') {
                 detail.textContent = state.install_snapraid_message || 'Installing...';
                 installBtn.style.display = 'none';
-                setupBody.style.display = 'none';
+                // Show the form while installing so the user can fill it in;
+                // Save Setup is still gated server-side. Keep polling.
+                setupBody.style.display = 'block';
+                if (!installPollTimer) installPollTimer = setInterval(refreshInstallState, 3000);
             } else if (state.install_snapraid_status === 'error') {
                 detail.textContent = 'Install failed: ' + (state.install_snapraid_message || 'unknown error');
                 installBtn.textContent = 'Retry Install';
@@ -342,7 +349,15 @@
                 setupBody.style.display = 'none';
                 if (installPollTimer) { clearInterval(installPollTimer); installPollTimer = null; }
             } else {
-                detail.textContent = 'SnapRAID is not installed yet.';
+                // No install attempted yet (or state unknown). The page-load
+                // kick normally starts one; if it didn't (e.g. it raced a
+                // still-in-flight install), start it here so the Setup tab
+                // doesn't dead-end, and poll.
+                if (!installPollTimer) {
+                    post('install_snapraid', {});
+                    installPollTimer = setInterval(refreshInstallState, 3000);
+                }
+                detail.textContent = 'SnapRAID is not installed yet - starting install...';
                 installBtn.textContent = 'Install SnapRAID';
                 installBtn.style.display = 'inline-block';
                 setupBody.style.display = 'none';
@@ -457,6 +472,15 @@
 
         document.getElementById('sre-schedule-select').value = SRE_PRESELECTED_SCHEDULE || 'daily';
         document.getElementById('sre-exclude-custom').value = SRE_CUSTOM_EXCLUDES || '';
+
+        // Reflect the saved exclude presets. The server renders these unchecked
+        // by default so that "no presets" (an explicitly empty EXCLUDES) can be
+        // told apart from the pristine defaults; here we tick exactly the saved
+        // ones. When EXCLUDES has never been set, SRE_SAVED_EXCLUDES carries the
+        // default list, so a first-time visit still shows the recommended ones.
+        document.querySelectorAll('.sre-exclude-preset').forEach(cb => {
+            cb.checked = SRE_SAVED_EXCLUDES.includes(cb.value);
+        });
 
         // Custom schedule: friendly day-of-week + time pickers that generate the
         // cron, with an "Advanced" mode for typing cron directly. The pickers
@@ -641,7 +665,11 @@
             custom_scrub_cron: customScrubCron,
             delete_threshold: threshold
         }).then(res => {
-            resultEl.textContent = res.ok ? 'Saved. Schedule installed.' : ('Error: ' + (res.error || 'unknown'));
+            if (res.ok) {
+                resultEl.textContent = res.warning ? ('Saved, but: ' + res.warning) : 'Saved. Schedule installed.';
+            } else {
+                resultEl.textContent = 'Error: ' + (res.error || 'unknown');
+            }
         });
     });
 

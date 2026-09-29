@@ -20,11 +20,25 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST' || !isset($_POST['sre_action'])) {
 
 $action = $_POST['sre_action'];
 
-// Cancel a running sync/scrub. The wrapper scripts are started with `setsid`,
-// so the PID they record in state.json is also their process-group id; a
-// `kill -TERM -- -PID` signals the whole group (wrapper + snapraid). We only
-// kill if the PID is still alive AND its command line is one of ours, so a
-// stale/recycled PID can never take down an unrelated process.
+// Process-group id of a PID, or 0 if unavailable. /proc/<pid>/stat field 5 is
+// pgrp, but the comm field (2) can contain spaces and parens, so parse from
+// after the last ')'.
+function sre_pgid_of($pid) {
+    $stat = @file_get_contents("/proc/{$pid}/stat");
+    if ($stat === false) return 0;
+    $close = strrpos($stat, ')');
+    if ($close === false) return 0;
+    $fields = preg_split('/\s+/', trim(substr($stat, $close + 1)));
+    return isset($fields[2]) ? intval($fields[2]) : 0;
+}
+
+// Cancel a running sync/scrub. The wrapper scripts re-exec under `setsid`
+// (or ajax starts them with it), so the PID they record in state.json is also
+// their process-group id; a `kill -TERM -- -PID` signals the whole group
+// (wrapper + snapraid). We only kill if the PID is still alive AND its command
+// line is one of ours, so a stale/recycled PID can never take down an unrelated
+// process. When the PID is NOT a group leader (e.g. `setsid` was unavailable
+// and the wrapper didn't re-exec), we fall back to signalling just that PID.
 function sre_cancel_operation($pidKey) {
     $stateRaw = @file_get_contents('/var/local/snapunraid/state.json');
     $stateArr = json_decode($stateRaw, true) ?: [];
@@ -36,8 +50,24 @@ function sre_cancel_operation($pidKey) {
     if ($cmdline === false || (strpos($cmdline, 'snapunraid') === false && strpos($cmdline, 'snapraid') === false)) {
         return ['ok' => false, 'error' => 'process not found or not ours'];
     }
-    shell_exec("kill -TERM -- -{$pid} 2>/dev/null");
+    if (sre_pgid_of($pid) === $pid) {
+        shell_exec("kill -TERM -- -{$pid} 2>/dev/null");
+    } else {
+        shell_exec("kill -TERM {$pid} 2>/dev/null");
+    }
     return ['ok' => true];
+}
+
+// Read the cron-fallback warning install_cron.sh leaves behind (e.g. the user's
+// custom cron was invalid, so we silently installed the daily default). Returns
+// '' when there is no warning. Consuming it clears the file so it is shown once.
+function sre_take_cron_warning() {
+    global $settingsIni;
+    $file = dirname($settingsIni) . '/cron-warning.txt';
+    if (!is_file($file)) return '';
+    $msg = trim(@file_get_contents($file));
+    @unlink($file);
+    return $msg;
 }
 
 // Merge key=value pairs into settings.ini, preserving any keys not being
@@ -118,7 +148,7 @@ switch ($action) {
         $schedule = $_POST['schedule'] ?? 'daily';
         $threshold = intval($_POST['delete_threshold'] ?? 50);
 
-        sre_ini_merge([
+        $merged = sre_ini_merge([
             'PARITY_PATH' => trim($_POST['parity_path'] ?? ''),
             'PARITY2_PATH' => trim($_POST['parity2_path'] ?? ''),
             'DATA_DISKS' => implode(',', $dataArr),
@@ -129,12 +159,37 @@ switch ($action) {
             'CUSTOM_SCRUB_CRON' => trim($_POST['custom_scrub_cron'] ?? ''),
             'DELETE_THRESHOLD_COUNT' => $threshold,
         ]);
+        if (!$merged) {
+            // Most likely the flash is read-only / full. Do not claim success:
+            // nothing was saved and the config was not regenerated.
+            echo json_encode(['ok' => false, 'error' => 'Could not write settings.ini on the flash drive (is it read-only or full?).']);
+            break;
+        }
 
         // regenerate snapraid.conf and (re)install the cron schedule
         $genOut = shell_exec("bash {$scriptDir}/genconfig.sh 2>&1");
         $cronOut = shell_exec("bash {$scriptDir}/install_cron.sh 2>&1");
+        $cronWarning = sre_take_cron_warning();
 
-        echo json_encode(['ok' => true, 'genconfig' => trim($genOut), 'cron' => trim($cronOut)]);
+        // install_cron.sh always prints exactly one "Installed schedule:" line
+        // on success; treat a missing line as a failure so the UI can't say
+        // "Saved" when the schedule silently didn't apply. genconfig.sh prints
+        // "OK: wrote ..." on success.
+        $genOk = (strpos($genOut, 'OK:') !== false);
+        $cronOk = (strpos($cronOut, 'Installed schedule:') !== false)
+               || (strpos($cronOut, 'Manual schedule selected') !== false);
+        if (!$genOk || !$cronOk) {
+            $detail = trim($genOk ? '' : $genOut);
+            if (!$cronOk) { $detail = trim($detail . "\n" . $cronOut); }
+            echo json_encode(['ok' => false,
+                'error' => 'Settings were written but the config/schedule could not be applied' .
+                           ($detail !== '' ? ': ' . $detail : '.'),
+                'warning' => $cronWarning]);
+            break;
+        }
+
+        echo json_encode(['ok' => true, 'warning' => $cronWarning,
+            'genconfig' => trim($genOut), 'cron' => trim($cronOut)]);
         break;
 
     case 'import_config':
@@ -311,24 +366,48 @@ switch ($action) {
 
     case 'get_log':
         $path = $_POST['path'] ?? '';
-        // only allow reading logs from our own log directory
-        if (preg_match('#^/var/local/snapunraid/logs/[A-Za-z0-9._-]+\.log$#', $path) && file_exists($path)) {
-            // Return only the tail of the log. Sync logs can be tens of MB of
-            // progress lines; the History tab only needs the end (summary,
-            // errors, final status). The full log stays on disk for debugging.
-            $maxBytes = 200 * 1024;
-            $size = filesize($path);
-            $offset = max(0, $size - $maxBytes);
-            $content = file_get_contents($path, false, null, $offset);
-            echo json_encode([
-                'ok' => true,
-                'content' => $content,
-                'truncated' => $size > $maxBytes,
-                'total_bytes' => $size,
-            ]);
-        } else {
-            echo json_encode(['ok' => false, 'error' => 'invalid log path']);
+        // Logs live in the tmpfs RUN_LOG dir; after a reboot only the bounded
+        // tails persisted on the flash remain. Resolve a requested tmpfs log to
+        // its persisted tail when the full log is gone, so History rows still
+        // open after a reboot. Both forms are regex-constrained (no traversal).
+        //
+        // These must match common.sh: LOG_DIR (SRE_LOG_DIR) and PERSIST_LOG_DIR
+        // (SRE_PERSIST_LOG_DIR, default <plugin home>/logs) and the '.tail'
+        // suffix written by sre_persist_log. Keep them in sync here.
+        $logDir = "/var/local/{$plugin}/logs";
+        $persistDir = "/boot/config/plugins/{$plugin}/logs";
+        $tailSuffix = '.tail';
+        $baseRe = '[A-Za-z0-9._-]+\.log';
+        $candidates = [];
+        if (preg_match('#^' . preg_quote($logDir, '#') . '/' . $baseRe . '$#', $path)) {
+            $candidates[] = $path;
+            $candidates[] = $persistDir . '/' . basename($path) . $tailSuffix;
+        } elseif (preg_match('#^' . preg_quote($persistDir, '#') . '/' . $baseRe . preg_quote($tailSuffix, '#') . '$#', $path)) {
+            $candidates[] = $path;
         }
+        $resolved = '';
+        foreach ($candidates as $c) {
+            if (is_file($c)) { $resolved = $c; break; }
+        }
+        if ($resolved === '') {
+            echo json_encode(['ok' => false, 'error' => 'invalid log path']);
+            break;
+        }
+        // Return only the tail of the log. Sync logs can be tens of MB of
+        // progress lines; the History tab only needs the end (summary, errors,
+        // final status). The full log stays on disk for debugging.
+        $maxBytes = 200 * 1024;
+        $size = filesize($resolved);
+        $offset = max(0, $size - $maxBytes);
+        $content = file_get_contents($resolved, false, null, $offset);
+        $isTail = (substr($resolved, -strlen($tailSuffix)) === $tailSuffix);
+        echo json_encode([
+            'ok' => true,
+            'content' => $content,
+            'truncated' => $size > $maxBytes || $isTail,
+            'persisted' => $isTail,
+            'total_bytes' => $size,
+        ]);
         break;
 
     default:

@@ -18,6 +18,10 @@ $settingsIni = '/boot/config/plugins/' . $plugin . '/settings.ini';
 // ---------------------------------------------------------------------------
 // Load current settings for pre-filling the Setup form
 // ---------------------------------------------------------------------------
+// Read a settings.ini value. A key that is present with an empty value returns
+// '' (NOT the default) - the default applies only when the key is absent. That
+// is what lets list-like settings such as EXCLUDES represent "the user cleared
+// every exclude"; scalar callers pass a sensible default for the absent case.
 function sre_ini_get($key, $default = '') {
     global $settingsIni;
     if (!file_exists($settingsIni)) return $default;
@@ -157,12 +161,12 @@ foreach ($importCandidates as $c) { if (file_exists($c)) { $importDetected = $c;
       <h3>3. Skip these (optional)</h3>
       <p class="sre-hint">Common junk / active-write locations are pre-checked. Add your own, one per line.</p>
       <div class="sre-checklist" id="sre-exclude-presets">
-        <label><input type="checkbox" value="/appdata/" class="sre-exclude-preset" checked> Docker appdata</label>
-        <label><input type="checkbox" value="/system/" class="sre-exclude-preset" checked> VM disk images (system share)</label>
-        <label><input type="checkbox" value="/domains/" class="sre-exclude-preset" checked> VM domains</label>
-        <label><input type="checkbox" value="/isos/" class="sre-exclude-preset" checked> ISOs</label>
-        <label><input type="checkbox" value="downloads/incomplete/" class="sre-exclude-preset" checked> In-progress downloads</label>
-        <label><input type="checkbox" value="*.tmp" class="sre-exclude-preset" checked> *.tmp files</label>
+        <label><input type="checkbox" value="/appdata/" class="sre-exclude-preset"> Docker appdata</label>
+        <label><input type="checkbox" value="/system/" class="sre-exclude-preset"> VM disk images (system share)</label>
+        <label><input type="checkbox" value="/domains/" class="sre-exclude-preset"> VM domains</label>
+        <label><input type="checkbox" value="/isos/" class="sre-exclude-preset"> ISOs</label>
+        <label><input type="checkbox" value="downloads/incomplete/" class="sre-exclude-preset"> In-progress downloads</label>
+        <label><input type="checkbox" value="*.tmp" class="sre-exclude-preset"> *.tmp files</label>
       </div>
       <textarea id="sre-exclude-custom" class="sre-textarea" placeholder="One extra pattern per line, e.g. *.partial"></textarea>
     </div>
@@ -342,6 +346,7 @@ const SRE_PRESELECTED_SCHEDULE = <?= json_encode($cur_schedule) ?>;
 const SRE_CUSTOM_SYNC_CRON = <?= json_encode($cur_custom_sync) ?>;
 const SRE_CUSTOM_SCRUB_CRON = <?= json_encode($cur_custom_scrub) ?>;
 const SRE_ALERTS = <?= json_encode($cur_alerts) ?>;
+const SRE_SAVED_EXCLUDES = <?= json_encode(array_values(array_filter(explode(',', $cur_excludes)))) ?>;
 const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
     array_filter(explode(',', $cur_excludes)),
     ['/appdata/', '/system/', '/domains/', '/isos/', 'downloads/incomplete/', '*.tmp']

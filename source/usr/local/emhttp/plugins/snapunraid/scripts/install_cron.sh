@@ -5,18 +5,12 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
 
-CRON_FILE="/etc/cron.d/snapunraid"
+CRON_FILE="${SRE_CRON_FILE:-/etc/cron.d/snapunraid}"
 SCHEDULE=$(sre_get_setting "SCHEDULE" "daily")
-
-# Validate a 5-field cron expression (minute hour day-of-month month day-of-week).
-sre_valid_cron() {
-    local fields f
-    IFS=' ' read -ra fields <<< "$1"
-    [[ ${#fields[@]} -eq 5 ]] || return 1
-    for f in "${fields[@]}"; do
-        [[ "$f" =~ ^[0-9*/,-]+$ ]] || return 1
-    done
-}
+# Written when a custom cron is rejected so the Setup tab can warn the user that
+# their schedule did not apply (the script's own output is otherwise swallowed).
+WARN_FILE="${SRE_WARN_FILE:-${PLUGIN_HOME}/cron-warning.txt}"
+rm -f "$WARN_FILE"
 
 case "$SCHEDULE" in
     daily)
@@ -43,6 +37,8 @@ case "$SCHEDULE" in
         SCRUB_CRON=$(sre_get_setting "CUSTOM_SCRUB_CRON" "0 4 * * 0")
         if ! sre_valid_cron "$SYNC_CRON" || ! sre_valid_cron "$SCRUB_CRON"; then
             echo "WARNING: invalid custom cron expression(s) - falling back to daily sync + weekly scrub."
+            printf 'Custom schedule was not applied: sync="%s", scrub="%s" is not a valid 5-field cron expression (minute hour day-of-month month day-of-week). Using nightly sync + weekly scrub instead.\n' \
+                "$SYNC_CRON" "$SCRUB_CRON" > "$WARN_FILE"
             SYNC_CRON="30 3 * * *"
             SCRUB_CRON="0 4 * * 0"
         fi

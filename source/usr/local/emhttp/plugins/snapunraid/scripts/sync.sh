@@ -12,9 +12,7 @@ source "${SCRIPT_DIR}/common.sh"
 # Ensure we run as a process-group leader so the webGUI can cancel us by
 # signalling the whole group. The webGUI starts us with `setsid`, but cron
 # does not - re-exec under setsid when we're not already a group leader.
-if [[ "$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')" != "$$" ]]; then
-    exec setsid bash "$0" "$@"
-fi
+sre_ensure_group_leader "$@"
 
 FORCE=0
 [[ "$1" == "--force" ]] && FORCE=1

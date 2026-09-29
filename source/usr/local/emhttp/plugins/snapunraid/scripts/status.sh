@@ -25,7 +25,9 @@ case "$ACTION" in
         # unformatted SnapRAID parity disk. Pure bash + jq (python3 is not
         # guaranteed present on Unraid).
         disks_json="[]"
-        skip=" user user0 disks remotes rootshare cache "
+        # Pseudo-/aggregate mounts to ignore. user0 (the fused user share) is
+        # matched by the disk* branch below; there is no plain "user" mount.
+        skip=" disks remotes rootshare cache "
 
         # 1) Mounted array/pool disks under /mnt (potential data disks).
         for entry in /mnt/*; do
@@ -133,7 +135,7 @@ case "$ACTION" in
         # with "SnapRAID is already in use!" while a sync/scrub holds it. Skip
         # the refresh then (keeping the last good cache) instead of clobbering
         # the Dashboard's file count with zeros.
-        RUNNING=$(jq -r 'if .sync_status == "running" or .scrub_status == "running" then 1 else 0 end' "$STATE_FILE" 2>/dev/null)
+        RUNNING=$(jq -r 'if .sync_status == "running" or .scrub_status == "running" or .check_status == "running" then 1 else 0 end' "$STATE_FILE" 2>/dev/null)
         if [[ "$RUNNING" == "1" ]]; then
             exit 0
         fi
@@ -160,7 +162,10 @@ case "$ACTION" in
         PARITY_FILE="/mnt/${PARITY_PATH}/snapraid.parity"
         PARITY_AGE=""
         if [[ -f "$PARITY_FILE" ]]; then
-            PARITY_AGE=$(( ($(date +%s) - $(stat -c %Y "$PARITY_FILE")) / 86400 ))
+            # %Z (ctime) rather than %Y (mtime): snapraid rewrites parity via a
+            # temp file + rename, so the inode's change time is the more accurate
+            # "parity was written" moment.
+            PARITY_AGE=$(( ($(date +%s) - $(stat -c %Z "$PARITY_FILE")) / 86400 ))
         fi
 
         # Second parity disk (optional) - same freshness measure.
@@ -169,7 +174,7 @@ case "$ACTION" in
         if [[ -n "$PARITY2_PATH" ]]; then
             PARITY2_FILE="/mnt/${PARITY2_PATH}/snapraid.parity-2"
             if [[ -f "$PARITY2_FILE" ]]; then
-                PARITY2_AGE=$(( ($(date +%s) - $(stat -c %Y "$PARITY2_FILE")) / 86400 ))
+                PARITY2_AGE=$(( ($(date +%s) - $(stat -c %Z "$PARITY2_FILE")) / 86400 ))
             fi
         fi
 

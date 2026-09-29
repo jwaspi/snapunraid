@@ -28,16 +28,35 @@ case "$ACTION" in
         # snapraid.conf as /mnt/disk4, so /mnt/d6 would be wrong) and preserves
         # paths containing ':'.
         #
+        # The log chosen is NOT simply the newest completed one: a fix's output
+        # is not a problem source, and a later sync can moot earlier "deleted
+        # since last sync" scrub errors. sre_latest_problem_log picks the most
+        # recently STARTED detection run and returns "<kind>\t<log>"; when the
+        # kind is sync the "missing" rows it just resolved are suppressed.
+        # Without that, a sync would not clear stale deleted-file entries until
+        # an unrelated re-check.
+        #
         # Deduplication and parsing are done with one awk|sort pass, NOT
         # per-line jq: a scrub with 100k+ error blocks (e.g. every block of
         # deleted files) would spawn a process per line and take minutes. One
         # jq call at the end builds the JSON array.
-        state=$(sre_read_state_json)
-        log=$(jq -r '.check_last_log // .scrub_last_log // .sync_last_log // ""' <<<"$state" 2>/dev/null)
+        selection=$(sre_latest_problem_log)
+        log_kind="${selection%%$'\t'*}"
+        log="${selection#*$'\t'}"
+        [[ "$selection" == *$'\t'* ]] || { log_kind=""; log=""; }
         if [[ -n "$log" && -f "$log" ]]; then
-            sre_parse_problem_tags "$log" | sre_resolve_problem_paths \
-                | jq -R -c 'split("\t") | {disk: .[0], path: .[1], reason: .[2], size: (.[3] | tonumber)}' \
-                | jq -c -s 'if length == 0 then [] else . end'
+            if [[ "$log_kind" == "sync" ]]; then
+                # A successful sync has just refreshed parity, so any "missing"
+                # (deleted-since-last-sync) entries are resolved; only real
+                # corruption from the sync's own scan is a problem.
+                sre_parse_problem_tags "$log" | awk -F'\t' '$3 != "missing"' | sre_resolve_problem_paths \
+                    | jq -R -c 'split("\t") | {disk: .[0], path: .[1], reason: .[2], size: (.[3] | tonumber)}' \
+                    | jq -c -s 'if length == 0 then [] else . end'
+            else
+                sre_parse_problem_tags "$log" | sre_resolve_problem_paths \
+                    | jq -R -c 'split("\t") | {disk: .[0], path: .[1], reason: .[2], size: (.[3] | tonumber)}' \
+                    | jq -c -s 'if length == 0 then [] else . end'
+            fi
         else
             echo "[]"
         fi
@@ -46,9 +65,7 @@ case "$ACTION" in
         # Full array check (errors only). Runs in the background (setsid) so
         # the webGUI can poll progress and cancel it. Parses the status: tags
         # into check_problems in state.json for the Recover tab.
-        if [[ "$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')" != "$$" ]]; then
-            exec setsid bash "$0" "$@"
-        fi
+        sre_ensure_group_leader "$@"
         sre_lock
         LOGFILE=$(sre_log_start "check")
         sre_write_state "check_status" "running" "check_started" "$(date +%s)"
@@ -104,6 +121,10 @@ case "$ACTION" in
             exit 1
         fi
         sre_lock
+        # Give any in-flight snapraid command (a Dashboard status-refresh, or
+        # another of our own runs) time to release snapraid's exclusive content
+        # lock first - otherwise the fix dies instantly with "already in use".
+        sre_wait_snapraid 120
         LOGFILE=$(sre_log_start "fix")
         snapraid --conf "$SNAPRAID_CONF" fix -d "$ARG" >> "$LOGFILE" 2>&1
         RC=$?
@@ -134,6 +155,7 @@ case "$ACTION" in
         DISK_LABEL="${SPLIT%%$'\t'*}"
         DISK_REL="${SPLIT#*$'\t'}"
         sre_lock
+        sre_wait_snapraid 120
         LOGFILE=$(sre_log_start "fix")
         snapraid --conf "$SNAPRAID_CONF" fix -d "$DISK_LABEL" -f "$DISK_REL" >> "$LOGFILE" 2>&1
         RC=$?
@@ -147,6 +169,7 @@ case "$ACTION" in
         ;;
     fix-all)
         sre_lock
+        sre_wait_snapraid 120
         LOGFILE=$(sre_log_start "fix")
         snapraid --conf "$SNAPRAID_CONF" fix >> "$LOGFILE" 2>&1
         RC=$?
