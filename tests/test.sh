@@ -217,6 +217,68 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# alerts.sh check #4 "scrub overdue" keys off the last COMPLETED scrub, not
+# snapraid's scrub_oldest_days. That value is the age of the single oldest
+# block, which for a percentage-based scrub (-p 12 -o 10) is a normal tail and
+# fired a false alert on a healthy, recently-scrubbed array.
+# ---------------------------------------------------------------------------
+export NOTIFY_LOG="$TMP/notify.log"
+cat > "$TMP/fake-notify" <<'EOF'
+#!/bin/bash
+echo "$*" >> "$NOTIFY_LOG"
+EOF
+chmod +x "$TMP/fake-notify"
+
+ASET="$TMP/alerts-settings.ini"
+cat > "$ASET" <<'EOF'
+ALERT_SYNC_OK=0
+ALERT_SYNC_ERROR=0
+ALERT_SYNC_CONFIRM=0
+ALERT_SCRUB_OK=0
+ALERT_SCRUB_ISSUES=0
+ALERT_RECOVER_OK=0
+ALERT_RECOVER_ERROR=0
+ALERT_CANCELLED=0
+ALERT_PARITY_STALE=0
+ALERT_DISK_OFFLINE=0
+ALERT_PARITY_SPACE=0
+ALERT_SCRUB_OVERDUE=1
+ALERT_CONTENT_STALE=0
+ALERT_PARITY_MISSING=0
+ALERT_UNRECOVERED=0
+ALERT_SCRUB_OVERDUE_DAYS=30
+DATA_DISKS=
+PARITY_PATH=
+PARITY2_PATH=
+CONTENT_DISKS=
+EOF
+
+export SRE_SETTINGS_FILE="$ASET"
+export SRE_STATE_FILE="$TMP/alerts-state.json"
+export SRE_NOTIFY_BIN="$TMP/fake-notify"
+
+run_alerts() { rm -f "$NOTIFY_LOG"; bash "$SCRIPTS/alerts.sh" check >/dev/null 2>&1; }
+NOW=$(date +%s)
+
+printf '{"scrub_finished":%s}\n' "$NOW" > "$SRE_STATE_FILE"
+run_alerts
+if [[ ! -s "$NOTIFY_LOG" ]]; then ok "alerts: recently scrubbed array does not warn"; else bad "alerts: recently scrubbed array does not warn" "$(cat "$NOTIFY_LOG")"; fi
+
+printf '{"scrub_finished":%s,"snapraid_scrub_oldest_days":32}\n' "$NOW" > "$SRE_STATE_FILE"
+run_alerts
+if [[ ! -s "$NOTIFY_LOG" ]]; then ok "alerts: old oldest-block with a recent scrub does not warn"; else bad "alerts: old oldest-block with a recent scrub does not warn" "$(cat "$NOTIFY_LOG")"; fi
+
+printf '{"scrub_finished":%s}\n' "$((NOW - 40*86400))" > "$SRE_STATE_FILE"
+run_alerts
+if grep -q "Scrub overdue" "$NOTIFY_LOG"; then ok "alerts: genuinely stale scrub warns"; else bad "alerts: genuinely stale scrub warns"; fi
+
+printf '{}\n' > "$SRE_STATE_FILE"
+run_alerts
+if [[ ! -s "$NOTIFY_LOG" ]]; then ok "alerts: never-scrubbed array does not warn yet"; else bad "alerts: never-scrubbed array does not warn yet" "$(cat "$NOTIFY_LOG")"; fi
+
+unset SRE_NOTIFY_BIN
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

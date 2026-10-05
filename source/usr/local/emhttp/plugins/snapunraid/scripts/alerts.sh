@@ -70,15 +70,32 @@ case "$ACTION" in
         fi
 
         # -------------------------------------------------------------------
-        # 4) Scrub overdue - the oldest file hasn't been scrubbed in too long.
-        #    Age comes from the cached status-refresh summary.
+        # 4) Scrub overdue - no scrub has run in too long.
+        #
+        #    This deliberately does NOT use snapraid's scrub_oldest_days.
+        #    That value is the age of the single OLDEST block in the array, and
+        #    snapraid only reports a "newest/median/oldest" spread; with the
+        #    percentage-based scrub this plugin runs (-p 12 -o 10: 12% of the
+        #    array, only blocks older than 10 days) the tail of the array is
+        #    EXPECTED to age well past any fixed threshold even when scrubs run
+        #    perfectly on schedule. On a large array where a large fraction of
+        #    blocks have never been scrubbed, scrub_oldest_days sits high for
+        #    weeks and the old check fired on a healthy, weekly-scrubbed array.
+        #
+        #    The actionable signal - and the thing within the operator's
+        #    control - is whether the scrub job is running at all. So watch the
+        #    last completed run rather than the block-age tail.
         # -------------------------------------------------------------------
         if sre_alert_enabled "ALERT_SCRUB_OVERDUE" "1"; then
             DAYS=$(sre_get_setting "ALERT_SCRUB_OVERDUE_DAYS" "30")
-            OLDEST=$(jq -r '.snapraid_scrub_oldest_days // ""' "$STATE_FILE" 2>/dev/null)
-            if [[ -n "$OLDEST" && "$OLDEST" -ge "$DAYS" ]]; then
-                sre_alert_once "alert_scrub_overdue_sent" "Scrub overdue" \
-                    "Oldest file was last scrubbed ${OLDEST} day(s) ago (threshold ${DAYS}). Run a scrub to verify data against parity." "warning"
+            LAST=$(jq -r '.scrub_finished // ""' "$STATE_FILE" 2>/dev/null)
+            # No scrub has ever run (fresh install) - nothing to warn about yet.
+            if [[ -n "$LAST" ]]; then
+                SINCE=$(( ( $(date +%s) - LAST ) / 86400 ))
+                if [[ "$SINCE" -ge "$DAYS" ]]; then
+                    sre_alert_once "alert_scrub_overdue_sent" "Scrub overdue" \
+                        "No scrub has completed in ${SINCE} day(s) (threshold ${DAYS}). Check the schedule, or run a scrub from the Dashboard." "warning"
+                fi
             fi
         fi
 

@@ -315,8 +315,8 @@ foreach ($importCandidates as $c) { if (file_exists($c)) { $importDetected = $c;
           <span class="sre-disk-size">below <input type="number" class="sre-input sre-alert-num" data-alert="ALERT_PARITY_SPACE_PCT" min="1" max="100">% free</span>
         </div>
         <div class="sre-alert-row">
-          <label><input type="checkbox" data-alert="ALERT_SCRUB_OVERDUE"> Scrub is overdue</label>
-          <span class="sre-disk-size">oldest file older than <input type="number" class="sre-input sre-alert-num" data-alert="ALERT_SCRUB_OVERDUE_DAYS" min="1" max="365"> days</span>
+          <label><input type="checkbox" data-alert="ALERT_SCRUB_OVERDUE"> No scrub has run recently</label>
+          <span class="sre-disk-size">in the last <input type="number" class="sre-input sre-alert-num" data-alert="ALERT_SCRUB_OVERDUE_DAYS" min="1" max="365"> days</span>
         </div>
         <div class="sre-alert-row">
           <label><input type="checkbox" data-alert="ALERT_CONTENT_STALE"> A content file is missing or stale</label>

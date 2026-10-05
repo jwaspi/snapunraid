@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "snapunraid">
   <!ENTITY author    "jwaspi">
-  <!ENTITY version   "2026.09.29">
+  <!ENTITY version   "2026.10.05">
   <!ENTITY launch    "Settings/snapunraid">
   <!ENTITY pluginURL "https://raw.githubusercontent.com/jwaspi/snapunraid/main/snapunraid.plg">
   <!ENTITY support   "https://github.com/jwaspi/snapunraid/issues">
@@ -10,6 +10,7 @@
 <PLUGIN name="snapunraid" version="&version;" author="&author;" icon="camera"
         pluginURL="&pluginURL;" support="&support;" launch="&launch;">
   <CHANGES><![CDATA[
+2026.10.05 - FIX: the "Scrub is overdue" health alert no longer fires on a healthy, recently-scrubbed array. It keyed off snapraid's scrub_oldest_days, which is the age of the single OLDEST block and can legitimately exceed any fixed threshold on a percentage-based scrub (-p 12 -o 10 re-scrubs a slice and lets the rest age), especially where a large share of blocks have never been scrubbed. It now warns only when no scrub has COMPLETED in ALERT_SCRUB_OVERDUE_DAYS, which reflects whether the schedule is actually running rather than the natural age tail of the blocks, and the Alerts tab wording is updated to match.
 2026.09.29 - Audit fixes and a test suite. (1) Lock discipline: Restore/Check now wait for any in-flight snapraid command to release its content lock like sync/scrub already did, and the Dashboard's background status-refresh also pauses during a full check, so a restore or check can no longer die with "SnapRAID is already in use!". (2) Setup: unchecking every exclude is now honored (the settings readers treated an empty value as "unset" and silently reinstated the defaults; list-like settings now use a raw reader), the saved preset checkboxes are restored instead of always rendering the defaults (including when the saved list has blank fields), and custom cron validation shares one helper. (3) Save Setup no longer reports "Saved" when settings.ini could not be written or the config/schedule failed to apply, and an invalid custom cron surfaces a visible warning instead of silently falling back to nightly. (4) Recover: "Files needing attention" now picks the most recently started detection run and reports its kind, rather than the first non-null state key, and a successful sync clears entries that were only "deleted since last sync" immediately instead of waiting for an unrelated re-check. (5) Cancellation no longer assumes setsid is installed and no longer assumes the recorded PID is a process-group leader; it falls back to signalling the process directly. (6) History logs: a bounded tail of each run log is saved to the flash so "view log" still works after a reboot wipes /var/local. (7) Misc: removed dead code, corrected the user0/pseudo-mount skip list, and used ctime for parity-age. (8) Added an offline unit-test suite (tests/run.sh) covering the label->mount mapping, problem parsing, error/block counting, empty-vs-unset settings, and metacharacter-safe settings writes.
 2026.09.28 - FIX: Recover tab path resolution and restore, bad-file counts, and settings corruption. (1) SnapRAID's error:/status: log tags carry the disk LABEL declared in snapraid.conf ("data d6 /mnt/disk4/"), not the mount name, so the old "/mnt/<label>/..." rebuild produced paths like /mnt/d6/... that don't exist, every listed size was 0, and "Restore this file" ran `snapraid fix -f <absolute path>` - which matches nothing, because --filter patterns are relative to the disk mount. Paths are now resolved through snapraid.conf, and single-file restore passes `-d <label> -f <relative path>`; a per-disk "Restore all on <disk>" button (using the previously-unreachable fix -d path) is offered when more than one disk has damage. (2) The Dashboard and scrub notification reported error BLOCKS as if they were files (a scrub flagging 115,700 blocks was really only 25 distinct files); the reported count is now the number of unique files, with the raw block count shown alongside it, and the "deleted since last sync" detection compares like with like. (3) A config value containing '&' or '|' silently corrupted settings.ini because sre_set_setting used sed, where '&' re-inserts the old match and '|' closes the s|...|...| expression; values are now written without sed, and settings.ini is written atomically (temp file + rename). (4) A full check now parses its results with one awk|sort pass instead of spawning a jq process per tag line (the same change already made for the Recover list), so a check on a degraded array no longer hangs for minutes, and check-/fix- logs are now pruned like sync/scrub logs so they can't grow without bound in RAM.
 2026.09.26 - FIX: the sync/scrub/health-check schedule did not survive a reboot. /etc/cron.d/snapunraid lives on the RAM rootfs and was only ever written when Setup was saved, so after every reboot no cron entries existed until someone reopened the plugin - the array silently ran unprotected. The event/started hook now reinstalls the schedule from settings.ini at boot. It is also shipped executable via a FILE Mode="0755" attribute, because the plugin's old top-level <RUN command="chmod ..."> never executed (Unraid's installer only processes <FILE> elements) and Unraid's emhttp_event dispatcher only runs hooks with the +x bit - so the hook had never run at all. The ignored <EVENT> tag was removed and the dead <RUN> housekeeping moved into an executable inline post-install FILE block.
@@ -359,8 +360,8 @@ foreach ($importCandidates as $c) { if (file_exists($c)) { $importDetected = $c;
           <span class="sre-disk-size">below <input type="number" class="sre-input sre-alert-num" data-alert="ALERT_PARITY_SPACE_PCT" min="1" max="100">% free</span>
         </div>
         <div class="sre-alert-row">
-          <label><input type="checkbox" data-alert="ALERT_SCRUB_OVERDUE"> Scrub is overdue</label>
-          <span class="sre-disk-size">oldest file older than <input type="number" class="sre-input sre-alert-num" data-alert="ALERT_SCRUB_OVERDUE_DAYS" min="1" max="365"> days</span>
+          <label><input type="checkbox" data-alert="ALERT_SCRUB_OVERDUE"> No scrub has run recently</label>
+          <span class="sre-disk-size">in the last <input type="number" class="sre-input sre-alert-num" data-alert="ALERT_SCRUB_OVERDUE_DAYS" min="1" max="365"> days</span>
         </div>
         <div class="sre-alert-row">
           <label><input type="checkbox" data-alert="ALERT_CONTENT_STALE"> A content file is missing or stale</label>
@@ -2013,15 +2014,32 @@ case "$ACTION" in
         fi
 
         # -------------------------------------------------------------------
-        # 4) Scrub overdue - the oldest file hasn't been scrubbed in too long.
-        #    Age comes from the cached status-refresh summary.
+        # 4) Scrub overdue - no scrub has run in too long.
+        #
+        #    This deliberately does NOT use snapraid's scrub_oldest_days.
+        #    That value is the age of the single OLDEST block in the array, and
+        #    snapraid only reports a "newest/median/oldest" spread; with the
+        #    percentage-based scrub this plugin runs (-p 12 -o 10: 12% of the
+        #    array, only blocks older than 10 days) the tail of the array is
+        #    EXPECTED to age well past any fixed threshold even when scrubs run
+        #    perfectly on schedule. On a large array where a large fraction of
+        #    blocks have never been scrubbed, scrub_oldest_days sits high for
+        #    weeks and the old check fired on a healthy, weekly-scrubbed array.
+        #
+        #    The actionable signal - and the thing within the operator's
+        #    control - is whether the scrub job is running at all. So watch the
+        #    last completed run rather than the block-age tail.
         # -------------------------------------------------------------------
         if sre_alert_enabled "ALERT_SCRUB_OVERDUE" "1"; then
             DAYS=$(sre_get_setting "ALERT_SCRUB_OVERDUE_DAYS" "30")
-            OLDEST=$(jq -r '.snapraid_scrub_oldest_days // ""' "$STATE_FILE" 2>/dev/null)
-            if [[ -n "$OLDEST" && "$OLDEST" -ge "$DAYS" ]]; then
-                sre_alert_once "alert_scrub_overdue_sent" "Scrub overdue" \
-                    "Oldest file was last scrubbed ${OLDEST} day(s) ago (threshold ${DAYS}). Run a scrub to verify data against parity." "warning"
+            LAST=$(jq -r '.scrub_finished // ""' "$STATE_FILE" 2>/dev/null)
+            # No scrub has ever run (fresh install) - nothing to warn about yet.
+            if [[ -n "$LAST" ]]; then
+                SINCE=$(( ( $(date +%s) - LAST ) / 86400 ))
+                if [[ "$SINCE" -ge "$DAYS" ]]; then
+                    sre_alert_once "alert_scrub_overdue_sent" "Scrub overdue" \
+                        "No scrub has completed in ${SINCE} day(s) (threshold ${DAYS}). Check the schedule, or run a scrub from the Dashboard." "warning"
+                fi
             fi
         fi
 
