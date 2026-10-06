@@ -217,6 +217,19 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Version comparison helpers. Lexical compare is wrong (14.10 > 14.9), and a
+# bare dotted version must not be stored as a JSON number (14.10 -> 14.1).
+# ---------------------------------------------------------------------------
+if sre_version_ge 14.10 14.9; then ok "sre_version_ge: 14.10 >= 14.9"; else bad "sre_version_ge: 14.10 >= 14.9"; fi
+if sre_version_ge 14.9 14.10; then bad "sre_version_ge: 14.9 < 14.10"; else ok "sre_version_ge: 14.9 < 14.10"; fi
+if sre_version_ge 14.10 14.10; then ok "sre_version_ge: equal versions"; else bad "sre_version_ge: equal versions"; fi
+if sre_version_ge 14.10.1 14.10; then ok "sre_version_ge: patch > minor"; else bad "sre_version_ge: patch > minor"; fi
+if sre_version_ge v14.10 v14.9; then ok "sre_version_ge: tolerates a leading v"; else bad "sre_version_ge: tolerates a leading v"; fi
+eq "sre_snapraid_ver_num 14.9"  "1409" "$(sre_snapraid_ver_num 14.9)"
+eq "sre_snapraid_ver_num 14.10" "1410" "$(sre_snapraid_ver_num 14.10)"
+eq "sre_snapraid_ver_num v14.10" "1410" "$(sre_snapraid_ver_num v14.10)"
+
+# ---------------------------------------------------------------------------
 # alerts.sh check #4 "scrub overdue" keys off the last COMPLETED scrub, not
 # snapraid's scrub_oldest_days. That value is the age of the single oldest
 # block, which for a percentage-based scrub (-p 12 -o 10) is a normal tail and

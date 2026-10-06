@@ -127,6 +127,20 @@ switch ($action) {
         echo json_encode(['ok' => true, 'started' => true]);
         break;
 
+    case 'update_snapraid':
+        // Upgrade to the latest SnapRAID release if newer; background so the
+        // download doesn't block, poll get_install_state for progress.
+        shell_exec("nohup bash {$scriptDir}/install_snapraid.sh --update > /dev/null 2>&1 &");
+        echo json_encode(['ok' => true, 'started' => true]);
+        break;
+
+    case 'check_snapraid_update':
+        // Resolve the latest release and record whether an update is available.
+        // background so a slow GitHub API call doesn't block the first paint.
+        shell_exec("nohup bash {$scriptDir}/install_snapraid.sh --check > /dev/null 2>&1 &");
+        echo json_encode(['ok' => true, 'started' => true]);
+        break;
+
     case 'get_install_state':
         echo shell_exec("bash {$scriptDir}/status.sh state");
         break;

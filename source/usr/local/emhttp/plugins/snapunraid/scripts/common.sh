@@ -70,6 +70,48 @@ sre_get_setting() {
     echo "$default"
 }
 
+# ---------------------------------------------------------------------------
+# Version comparison.
+#
+# SnapRAID versions are dotted release numbers (14.9, 14.10, 14.10.1). A
+# lexical compare is wrong ("14.10" < "14.9"), so compare component-wise.
+#
+#   sre_version_ge <a> <b>   -> exit 0 if a >= b, else 1
+# ---------------------------------------------------------------------------
+sre_version_ge() {
+    local a="${1#v}" b="${2#v}" i
+    [[ "$a" == "$b" ]] && return 0
+    local -a A B
+    IFS='.' read -r -a A <<< "$a"
+    IFS='.' read -r -a B <<< "$b"
+    local n=${#A[@]}
+    (( ${#B[@]} > n )) && n=${#B[@]}
+    for (( i = 0; i < n; i++ )); do
+        local ai="${A[i]:-0}" bi="${B[i]:-0}"
+        # Non-numeric components compare as 0 so a tag like "14.10-rc1" still
+        # yields a usable ordering rather than erroring.
+        [[ "$ai" =~ ^[0-9]+$ ]] || ai=0
+        [[ "$bi" =~ ^[0-9]+$ ]] || bi=0
+        if (( ai > bi )); then return 0; fi
+        if (( ai < bi )); then return 1; fi
+    done
+    return 0
+}
+
+# Numeric form for JSON-safe storage. The state writer stores a bare dotted
+# value like 14.10 as the JSON number 14.1 (trailing zero dropped), which
+# breaks string comparisons in the UI, so record "major*100 + minor" (14.9 ->
+# 1409, 14.10 -> 1410) as a plain integer alongside the display string.
+sre_snapraid_ver_num() {
+    local v="${1#v}"
+    local major="${v%%.*}"
+    local rest="${v#*.}"
+    local minor="${rest%%.*}"
+    [[ "$major" =~ ^[0-9]+$ ]] || major=0
+    [[ "$minor" =~ ^[0-9]+$ ]] || minor=0
+    echo $(( major * 100 + minor ))
+}
+
 sre_set_setting() {
     # Rewrite the file in bash rather than with `sed -i`. A value can contain
     # sed metacharacters (EXCLUDES patterns are user-supplied and paths can

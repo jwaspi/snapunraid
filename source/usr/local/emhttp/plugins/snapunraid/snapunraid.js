@@ -315,6 +315,11 @@
     post('get_install_state').then(state => {
         if (!state.snapraid_installed && !state.install_snapraid_status) {
             post('install_snapraid', {});
+        } else if (state.snapraid_installed) {
+            // Refresh the "is a newer SnapRAID available" status in the
+            // background. The check is cached server-side (6h), so this does
+            // not hit the GitHub API on every page load.
+            post('check_snapraid_update', {}).then(() => setTimeout(refreshInstallState, 2500));
         }
     });
 
@@ -329,15 +334,39 @@
             const detail = document.getElementById('sre-install-detail');
             const installBtn = document.getElementById('sre-btn-install-snapraid');
             const setupBody = document.getElementById('sre-setup-body');
+            const updateDetail = document.getElementById('sre-update-detail');
+            const updateBtn = document.getElementById('sre-btn-update-snapraid');
+            const checkBtn = document.getElementById('sre-btn-check-update');
 
             if (state.snapraid_installed) {
                 detail.textContent = 'Installed: ' + (state.snapraid_version || 'snapraid');
                 installBtn.style.display = 'none';
                 setupBody.style.display = 'block';
                 if (installPollTimer) { clearInterval(installPollTimer); installPollTimer = null; }
+
+                // Update status (only meaningful once installed). update_available
+                // is a real boolean in state.json; tolerate string forms too.
+                const latest = state.snapraid_latest_version;
+                const avail = state.snapraid_update_available === true || state.snapraid_update_available === 'true';
+                if (updateBtn) updateBtn.style.display = avail ? 'inline-block' : 'none';
+                if (checkBtn) checkBtn.style.display = 'inline-block';
+                if (updateDetail) {
+                    if (avail) {
+                        updateDetail.style.display = 'block';
+                        updateDetail.textContent = `A newer SnapRAID is available (${latest}) - update to stay current.`;
+                    } else if (latest) {
+                        updateDetail.style.display = 'block';
+                        updateDetail.textContent = `Up to date (latest ${latest}).`;
+                    } else {
+                        updateDetail.style.display = 'none';
+                    }
+                }
             } else if (state.install_snapraid_status === 'running') {
                 detail.textContent = state.install_snapraid_message || 'Installing...';
                 installBtn.style.display = 'none';
+                if (updateBtn) updateBtn.style.display = 'none';
+                if (checkBtn) checkBtn.style.display = 'none';
+                if (updateDetail) updateDetail.style.display = 'none';
                 // Show the form while installing so the user can fill it in;
                 // Save Setup is still gated server-side. Keep polling.
                 setupBody.style.display = 'block';
@@ -346,6 +375,9 @@
                 detail.textContent = 'Install failed: ' + (state.install_snapraid_message || 'unknown error');
                 installBtn.textContent = 'Retry Install';
                 installBtn.style.display = 'inline-block';
+                if (updateBtn) updateBtn.style.display = 'none';
+                if (checkBtn) checkBtn.style.display = 'none';
+                if (updateDetail) updateDetail.style.display = 'none';
                 setupBody.style.display = 'none';
                 if (installPollTimer) { clearInterval(installPollTimer); installPollTimer = null; }
             } else {
@@ -360,6 +392,9 @@
                 detail.textContent = 'SnapRAID is not installed yet - starting install...';
                 installBtn.textContent = 'Install SnapRAID';
                 installBtn.style.display = 'inline-block';
+                if (updateBtn) updateBtn.style.display = 'none';
+                if (checkBtn) checkBtn.style.display = 'none';
+                if (updateDetail) updateDetail.style.display = 'none';
                 setupBody.style.display = 'none';
             }
             return state;
@@ -373,6 +408,31 @@
         post('install_snapraid', {}).then(() => {
             if (installPollTimer) clearInterval(installPollTimer);
             installPollTimer = setInterval(refreshInstallState, 3000);
+        });
+    });
+
+    const updateBtn = document.getElementById('sre-btn-update-snapraid');
+    if (updateBtn) updateBtn.addEventListener('click', () => {
+        document.getElementById('sre-update-detail').textContent = 'Updating SnapRAID...';
+        updateBtn.style.display = 'none';
+        post('update_snapraid', {}).then(() => {
+            if (installPollTimer) clearInterval(installPollTimer);
+            installPollTimer = setInterval(refreshInstallState, 3000);
+        });
+    });
+
+    const checkUpdateBtn = document.getElementById('sre-btn-check-update');
+    if (checkUpdateBtn) checkUpdateBtn.addEventListener('click', () => {
+        const updateDetail = document.getElementById('sre-update-detail');
+        updateDetail.style.display = 'block';
+        updateDetail.textContent = 'Checking for updates...';
+        checkUpdateBtn.disabled = true;
+        post('check_snapraid_update', {}).then(() => {
+            // The check runs in the background; give it a moment, then refresh.
+            setTimeout(() => {
+                refreshInstallState();
+                checkUpdateBtn.disabled = false;
+            }, 2500);
         });
     });
 

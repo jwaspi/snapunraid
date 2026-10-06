@@ -134,7 +134,12 @@ foreach ($importCandidates as $c) { if (file_exists($c)) { $importDetected = $c;
     <div class="sre-card" id="sre-snapraid-install-card">
       <h3>SnapRAID binary</h3>
       <p class="sre-hint" id="sre-install-detail">Checking whether SnapRAID is installed…</p>
-      <button class="sre-btn sre-btn-primary" id="sre-btn-install-snapraid" style="display:none;">Install SnapRAID</button>
+      <p class="sre-hint" id="sre-update-detail" style="display:none;"></p>
+      <div class="sre-btn-row">
+        <button class="sre-btn sre-btn-primary" id="sre-btn-install-snapraid" style="display:none;">Install SnapRAID</button>
+        <button class="sre-btn sre-btn-primary" id="sre-btn-update-snapraid" style="display:none;">Update SnapRAID</button>
+        <button class="sre-btn" id="sre-btn-check-update" style="display:none;">Check for updates</button>
+      </div>
     </div>
 
     <div id="sre-setup-body" style="display:none;">

@@ -63,6 +63,7 @@
 .sre-btn-primary:hover { background: #ffa14f; }
 .sre-btn-warn { background: #e53935; border-color: #e53935; color: #fff; }
 .sre-btn-warn:hover { background: #ef5350; }
+.sre-btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 
 .sre-select, .sre-input, .sre-textarea {
     width: 100%; padding: 8px 10px; border-radius: 6px;
