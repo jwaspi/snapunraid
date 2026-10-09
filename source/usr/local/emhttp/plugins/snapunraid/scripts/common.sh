@@ -479,6 +479,71 @@ sre_read_history() {
     jq -cn '[inputs] | reverse' "$HISTORY_FILE" 2>/dev/null || jq -cn '[ ]' 2>/dev/null
 }
 
+# ---------------------------------------------------------------------------
+# Rehydrate the Dashboard's "last run" fields from the persistent history.
+#
+# state.json lives in tmpfs and is wiped on every reboot, but history.jsonl is
+# on the flash and survives. Without this the Dashboard reports "Last sync:
+# never" and "No activity yet" after a reboot while the History tab still lists
+# the runs - both read the same plugin, just different stores. Rebuild the
+# last sync/scrub summary from the newest history record of each type.
+#
+# Only fills a type when state has no finished timestamp AND that type is not
+# currently running, so a live sync/scrub is never clobbered by an old history
+# entry. The reconstructed fields are written back to state.json so this jq
+# read happens once, not on every Dashboard poll.
+# ---------------------------------------------------------------------------
+sre_hydrate_state_from_history() {
+    [[ -f "$HISTORY_FILE" ]] || return 0
+
+    local updates=()
+
+    # --- last sync ---
+    if [[ -z "$(jq -r '.sync_finished // ""' "$STATE_FILE" 2>/dev/null)" \
+       && "$(jq -r '.sync_status // ""' "$STATE_FILE" 2>/dev/null)" != "running" ]]; then
+        local last_sync
+        last_sync=$(jq -s -c 'map(select(.type == "sync")) | last // empty' "$HISTORY_FILE" 2>/dev/null)
+        if [[ -n "$last_sync" ]]; then
+            updates+=("sync_finished"     "$(jq -r '.ts' <<<"$last_sync")" \
+                      "sync_status"       "$(jq -r '.status // "ok"' <<<"$last_sync")" \
+                      "sync_last_added"   "$(jq -r '.added // 0' <<<"$last_sync")" \
+                      "sync_last_removed" "$(jq -r '.removed // 0' <<<"$last_sync")" \
+                      "sync_last_updated" "$(jq -r '.updated // 0' <<<"$last_sync")")
+        fi
+    fi
+
+    # --- last scrub ---
+    if [[ -z "$(jq -r '.scrub_finished // ""' "$STATE_FILE" 2>/dev/null)" \
+       && "$(jq -r '.scrub_status // ""' "$STATE_FILE" 2>/dev/null)" != "running" ]]; then
+        local last_scrub status bad msg
+        last_scrub=$(jq -s -c 'map(select(.type == "scrub")) | last // empty' "$HISTORY_FILE" 2>/dev/null)
+        if [[ -n "$last_scrub" ]]; then
+            # history records the status as "issues"; the state/Dashboard
+            # vocabulary is "issues_found".
+            status=$(jq -r '.status // "ok"' <<<"$last_scrub")
+            [[ "$status" == "issues" ]] && status="issues_found"
+            # The newest record for a run may be a message-only follow-up with
+            # no bad_files (the all-deleted case appends one); take the count
+            # from the newest record that actually carries it.
+            bad=$(jq -s -r 'map(select(.type == "scrub" and has("bad_files"))) | last | .bad_files // empty' "$HISTORY_FILE" 2>/dev/null)
+            updates+=("scrub_finished" "$(jq -r '.ts' <<<"$last_scrub")" \
+                      "scrub_status"   "$status")
+            [[ -n "$bad" ]] && updates+=("scrub_last_bad_files" "$bad")
+            # A message on the newest scrub record means scrub.sh's "all errors
+            # are files deleted since the last sync" branch ran: those are not
+            # damage, so mark them as missing to make the Dashboard show
+            # "Sync needed" rather than "Attention needed".
+            msg=$(jq -r '.message // ""' <<<"$last_scrub")
+            if [[ -n "$msg" && -n "$bad" && "$status" == "issues_found" ]]; then
+                updates+=("scrub_missing_files" "$bad")
+            fi
+        fi
+    fi
+
+    [[ ${#updates[@]} -gt 0 ]] && sre_write_state "${updates[@]}"
+    return 0
+}
+
 # Pick the log whose problem list is most current, for the Recover tab.
 #
 # A fix's output is NOT a problem source, and a later command can have already

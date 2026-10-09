@@ -183,6 +183,35 @@ eq "sre_persist_log bounds the tail" "65536" "$(stat -c %s "$PT")"
 if tail -c 20 "$PT" | grep -q 'FINAL LINE'; then ok "persisted tail keeps the end of the log"; else bad "persisted tail keeps the end of the log"; fi
 
 # ---------------------------------------------------------------------------
+# sre_hydrate_state_from_history - after a reboot the tmpfs state.json is gone
+# but history.jsonl (flash) remains, so the Dashboard's "last run" fields must
+# be rebuilt from it - otherwise the Dashboard says "never" while History lists
+# the runs. A live run must never be clobbered by an old history entry.
+# ---------------------------------------------------------------------------
+cat > "$HISTORY_FILE" <<'EOF'
+{"ts":1000,"type":"sync","status":"ok","added":"5","removed":"1","updated":"2","log":"/x/sync-1.log"}
+{"ts":2000,"type":"scrub","status":"ok","bad_files":"0","log":"/x/scrub-1.log"}
+{"ts":3000,"type":"sync","status":"error","message":"snapraid sync exited with code 1","log":"/x/sync-2.log"}
+{"ts":4000,"type":"scrub","status":"issues","bad_files":"4","log":"/x/scrub-2.log"}
+{"ts":4000,"type":"scrub","status":"issues","message":"All 4 scrub error file(s) are from files deleted or renamed since the last sync - not corruption.","log":"/x/scrub-2.log"}
+EOF
+printf '{}\n' > "$STATE_FILE"
+sre_hydrate_state_from_history
+eq "hydrate: last sync finished ts"       "3000" "$(jq -r '.sync_finished' "$STATE_FILE")"
+eq "hydrate: last sync status (error)"    "error" "$(jq -r '.sync_status' "$STATE_FILE")"
+eq "hydrate: sync counts from history"    "0" "$(jq -r '.sync_last_added' "$STATE_FILE")"
+eq "hydrate: last scrub finished ts"      "4000" "$(jq -r '.scrub_finished' "$STATE_FILE")"
+eq "hydrate: scrub issues -> issues_found" "issues_found" "$(jq -r '.scrub_status' "$STATE_FILE")"
+eq "hydrate: scrub bad_files from same run" "4" "$(jq -r '.scrub_last_bad_files' "$STATE_FILE")"
+eq "hydrate: deleted-only scrub marks missing" "4" "$(jq -r '.scrub_missing_files' "$STATE_FILE")"
+
+# A live run's state must be left untouched by hydration.
+printf '{"sync_status":"running"}\n' > "$STATE_FILE"
+sre_hydrate_state_from_history
+eq "hydrate: leaves a running sync alone" "running" "$(jq -r '.sync_status' "$STATE_FILE")"
+eq "hydrate: still fills the idle scrub"  "4000" "$(jq -r '.scrub_finished' "$STATE_FILE")"
+
+# ---------------------------------------------------------------------------
 # install_cron.sh: custom cron, invalid-cron warning file, manual mode.
 # ---------------------------------------------------------------------------
 export SRE_CRON_FILE="$TMP/cron.d"

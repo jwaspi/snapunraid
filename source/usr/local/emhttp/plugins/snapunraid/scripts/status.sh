@@ -13,6 +13,10 @@ ACTION="${1:-state}"
 
 case "$ACTION" in
     state)
+        # Rebuild the Dashboard's "last run" fields from the persistent history
+        # if the tmpfs state was lost (a reboot wiped /var/local). No-op when
+        # state already has them or a run is in progress.
+        sre_hydrate_state_from_history
         sre_read_state_json
         ;;
     history)
