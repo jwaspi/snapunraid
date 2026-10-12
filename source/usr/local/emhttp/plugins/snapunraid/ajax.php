@@ -219,6 +219,7 @@ switch ($action) {
         // settings.ini so the Setup keys are preserved.
         $toggles = [
             'ALERT_SYNC_OK' => '0', 'ALERT_SYNC_ERROR' => '1', 'ALERT_SYNC_CONFIRM' => '1',
+            'ALERT_SYNC_WARNING' => '1',
             'ALERT_SCRUB_OK' => '0', 'ALERT_SCRUB_ISSUES' => '1',
             'ALERT_RECOVER_OK' => '0', 'ALERT_RECOVER_ERROR' => '1', 'ALERT_CANCELLED' => '0',
             'ALERT_PARITY_STALE' => '1', 'ALERT_DISK_OFFLINE' => '1',

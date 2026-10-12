@@ -116,14 +116,26 @@ error:100:d6:movies/My Film.mkv: Data error at offset 512
 error:101:d6:movies/My Film.mkv: Data error at offset 1024
 error_data:200:d1:backup/a:b.bin: Unrecoverable error
 error:300:d1:gone/file.txt: Open error. No such file or directory.
+error:400:d2:storage/Downloads/_staging/Show/S01E01.mkv: Unexpected attribute change
+error:401:d2:storage/Downloads/_staging/Show/S01E01.mkv: Unexpected attribute change
+error:402:d2:other/TimeChanged.mkv: Unexpected time change
+error:403:d3:other/Big.bin: Unexpected size change
+error:404:d3:other/Ino.bin: Unexpected inode change
+error:500:d1:data/Corrupt.bin: Unexpected data change
 status:recoverable:d6:movies/Other.mkv
 status:unrecoverable:d1:backup/bad.bin
 not a tag: error:1:d1:x
 EOF
 PARSED="$(sre_parse_problem_tags "$LOG")"
-eq "parse: unique problem rows" "5" "$(printf '%s\n' "$PARSED" | grep -c .)"
+eq "parse: unique problem rows" "10" "$(printf '%s\n' "$PARSED" | grep -c .)"
 has "parse: checksum reason"    <(printf '%s' "$PARSED") $'d6\tmovies/My Film.mkv\tchecksum mismatch'
 has "parse: missing reason"     <(printf '%s' "$PARSED") $'d1\tgone/file.txt\tmissing'
+has "parse: modified reason (attribute change)" <(printf '%s' "$PARSED") $'d2\tstorage/Downloads/_staging/Show/S01E01.mkv\tmodified'
+has "parse: time change -> modified" <(printf '%s' "$PARSED") $'d2\tother/TimeChanged.mkv\tmodified'
+has "parse: size change -> modified" <(printf '%s' "$PARSED") $'d3\tother/Big.bin\tmodified'
+has "parse: inode change -> modified" <(printf '%s' "$PARSED") $'d3\tother/Ino.bin\tmodified'
+has "parse: data change stays damage, message stripped" <(printf '%s' "$PARSED") $'d1\tdata/Corrupt.bin\tchecksum mismatch'
+eq "parse: no Unexpected message leaks into paths" "0" "$(printf '%s\n' "$PARSED" | grep -c 'Unexpected ')"
 has "parse: recoverable status" <(printf '%s' "$PARSED") $'d6\tmovies/Other.mkv\trecoverable'
 has "parse: unrecoverable"      <(printf '%s' "$PARSED") $'d1\tbackup/bad.bin\tunrecoverable'
 has "parse: colon in path kept" <(printf '%s' "$PARSED") $'d1\tbackup/a:b.bin\tchecksum mismatch'
@@ -143,6 +155,11 @@ summary:error_data:0
 EOF
 eq "sre_log_error_count sums soft+io+data" "3" "$(sre_log_error_count "$SLOG")"
 eq "sre_log_summary sync line" "10 added, 2 removed, 3 updated, 3 error(s)" "$(sre_log_summary "$SLOG" sync)"
+
+# sre_log_errors extracts soft/io/data/exit in one pass.
+ELOG="$TMP/err.log"
+printf 'summary:error_soft:835285\nsummary:error_io:0\nsummary:error_data:0\nsummary:exit:warning\n' > "$ELOG"
+eq "sre_log_errors one-pass breakdown" "835285 0 0 warning" "$(sre_log_errors "$ELOG")"
 
 # ---------------------------------------------------------------------------
 # sre_latest_problem_log - picks the most recently STARTED detection run, not
@@ -257,6 +274,18 @@ if sre_version_ge v14.10 v14.9; then ok "sre_version_ge: tolerates a leading v";
 eq "sre_snapraid_ver_num 14.9"  "1409" "$(sre_snapraid_ver_num 14.9)"
 eq "sre_snapraid_ver_num 14.10" "1410" "$(sre_snapraid_ver_num 14.10)"
 eq "sre_snapraid_ver_num v14.10" "1410" "$(sre_snapraid_ver_num v14.10)"
+
+# ---------------------------------------------------------------------------
+# sre_run_outcome - a non-zero snapraid exit from SOFT errors only (files
+# modified during the run) is a warning, not a failure; I/O or data errors and
+# generic failures stay errors.
+# ---------------------------------------------------------------------------
+eq "sre_run_outcome: exit 0 is ok" "ok" "$(sre_run_outcome 0 0 0 0 '')"
+eq "sre_run_outcome: exit-warning tag" "warning" "$(sre_run_outcome 1 835285 0 0 warning)"
+eq "sre_run_outcome: soft-only is warning" "warning" "$(sre_run_outcome 1 5 0 0 '')"
+eq "sre_run_outcome: io error is error" "error" "$(sre_run_outcome 1 5 2 0 '')"
+eq "sre_run_outcome: data error is error" "error" "$(sre_run_outcome 1 5 0 1 '')"
+eq "sre_run_outcome: generic failure is error" "error" "$(sre_run_outcome 1 0 0 0 '')"
 
 # ---------------------------------------------------------------------------
 # alerts.sh check #4 "scrub overdue" keys off the last COMPLETED scrub, not

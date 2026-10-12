@@ -270,29 +270,64 @@ sre_prune_logs
 SUMMARY=$(sre_log_summary "$LOGFILE" "sync")
 DURATION=$(sre_duration "$(jq -r '.sync_started // 0' "$STATE_FILE" 2>/dev/null)")
 
-if [[ $SYNC_RC -eq 0 ]]; then
-    sre_write_state "sync_status" "ok" "sync_finished" "$(date +%s)" \
-        "sync_last_added" "$ADDED" "sync_last_removed" "$REMOVED" "sync_last_updated" "$UPDATED" \
-        "sync_last_log" "$LOGFILE" "sync_last_error" "" "sync_pid" "" "sync_progress" ""
-    sre_append_history "sync" "ok" "added" "$ADDED" "removed" "$REMOVED" "updated" "$UPDATED" "log" "$LOGFILE"
-    sre_notify "Sync completed" "${SUMMARY}${DURATION:+, took ${DURATION}}." "normal"
-    # A scrub that ONLY reported "file deleted since last sync" blocks is fully
-    # resolved by this sync (its issues were unsynced deletions, now synced).
-    # Clear the stale issues status so the Dashboard returns to "Protected"
-    # instead of staying on "Attention needed" until the next scrub. Real
-    # corruption (any non-missing error) is left untouched for re-scrubbing.
-    SCRUB_RESOLVED=$(jq -r 'if .scrub_status == "issues_found" \
+# A non-zero exit is not always a failure. SnapRAID exits non-zero (tagging the
+# log "summary:exit:warning") when it hit only SOFT errors, which is what
+# happens when files are modified while the sync reads them ("You cannot modify
+# files while running"). The run still saves its state and the affected blocks
+# are simply left unsynced, so this is a warning (remedy: re-run the sync), not
+# a hard failure. Classify it with the shared helper, reading the log once.
+read -r SOFT IOE DATAE EXIT_TAG <<< "$(sre_log_errors "$LOGFILE")"
+OUTCOME=$(sre_run_outcome "$SYNC_RC" "${SOFT:-0}" "${IOE:-0}" "${DATAE:-0}" "$EXIT_TAG")
+
+# A scrub that ONLY reported "file deleted since last sync" blocks is fully
+# resolved by this sync (its issues were unsynced deletions, now synced). Clear
+# the stale issues status so the Dashboard returns to "Protected" instead of
+# staying on "Attention needed" until the next scrub. Real corruption (any
+# non-missing error) is left untouched for re-scrubbing. Runs on both ok and
+# warning outcomes - the sync saved its state either way.
+sre_clear_resolved_scrub_issues() {
+    local resolved
+    resolved=$(jq -r 'if .scrub_status == "issues_found" \
         and ((.scrub_missing_files // 0 | tonumber) > 0) \
         and ((.scrub_missing_files // 0 | tonumber) == (.scrub_last_bad_files // 0 | tonumber)) \
         then 1 else 0 end' "$STATE_FILE" 2>/dev/null)
-    if [[ "$SCRUB_RESOLVED" == "1" ]]; then
+    if [[ "$resolved" == "1" ]]; then
         sre_write_state "scrub_status" "ok" "scrub_last_bad_files" "0" "scrub_missing_files" "0"
     fi
-else
-    sre_write_state "sync_status" "error" "sync_finished" "$(date +%s)" "sync_last_log" "$LOGFILE" \
-        "sync_last_error" "snapraid sync exited with code ${SYNC_RC}, see log" "sync_pid" "" "sync_progress" ""
-    sre_append_history "sync" "error" "message" "snapraid sync exited with code ${SYNC_RC}" "log" "$LOGFILE"
-    sre_notify "Sync failed" "snapraid sync exited with code ${SYNC_RC}. ${SUMMARY}${DURATION:+, took ${DURATION}}. Check the log in the plugin's Dashboard tab." "alert"
-fi
+}
+
+case "$OUTCOME" in
+    ok)
+        sre_write_state "sync_status" "ok" "sync_finished" "$(date +%s)" \
+            "sync_last_added" "$ADDED" "sync_last_removed" "$REMOVED" "sync_last_updated" "$UPDATED" \
+            "sync_last_log" "$LOGFILE" "sync_last_error" "" "sync_pid" "" "sync_progress" ""
+        sre_append_history "sync" "ok" "added" "$ADDED" "removed" "$REMOVED" "updated" "$UPDATED" "log" "$LOGFILE"
+        sre_notify "Sync completed" "${SUMMARY}${DURATION:+, took ${DURATION}}." "normal"
+        sre_clear_resolved_scrub_issues
+        ;;
+    warning)
+        # Report in FILES, not error blocks: SnapRAID counts blocks, and one
+        # changed file can span thousands of them (835k blocks == 244 files in
+        # a real incident). Count every soft-error row that is not "missing"
+        # (deleted): those are the changed-but-unsynced files. A sync resolves
+        # deleted rows itself. The parser dedups and strips the message in one
+        # pass.
+        UNSYNCED_FILES=$(sre_parse_problem_tags "$LOGFILE" | awk -F'\t' '$3 != "missing" {n++} END{print n+0}')
+        MSG="${UNSYNCED_FILES} file(s) changed while the sync was running and were not protected - re-run the sync when they are idle, or exclude their folder. All other files synced normally."
+        sre_write_state "sync_status" "warning" "sync_finished" "$(date +%s)" \
+            "sync_last_added" "$ADDED" "sync_last_removed" "$REMOVED" "sync_last_updated" "$UPDATED" \
+            "sync_last_log" "$LOGFILE" "sync_last_error" "" "sync_pid" "" "sync_progress" ""
+        sre_append_history "sync" "warning" "added" "$ADDED" "removed" "$REMOVED" "updated" "$UPDATED" \
+            "bad_files" "$UNSYNCED_FILES" "message" "$MSG" "log" "$LOGFILE"
+        sre_notify "Sync completed with warnings" "${MSG}${DURATION:+ (took ${DURATION})}" "warning"
+        sre_clear_resolved_scrub_issues
+        ;;
+    *)
+        sre_write_state "sync_status" "error" "sync_finished" "$(date +%s)" "sync_last_log" "$LOGFILE" \
+            "sync_last_error" "snapraid sync exited with code ${SYNC_RC}, see log" "sync_pid" "" "sync_progress" ""
+        sre_append_history "sync" "error" "message" "snapraid sync exited with code ${SYNC_RC}" "log" "$LOGFILE"
+        sre_notify "Sync failed" "snapraid sync exited with code ${SYNC_RC}. ${SUMMARY}${DURATION:+, took ${DURATION}}. Check the log in the plugin's Dashboard tab." "alert"
+        ;;
+esac
 
 exit $SYNC_RC

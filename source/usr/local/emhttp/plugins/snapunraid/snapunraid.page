@@ -43,6 +43,7 @@ $cur_custom_scrub = sre_ini_get('CUSTOM_SCRUB_CRON', '0 4 * * 0');
 $cur_threshold= sre_ini_get('DELETE_THRESHOLD_COUNT', '50');
 $alertDefaults = [
     'ALERT_SYNC_OK' => '0', 'ALERT_SYNC_ERROR' => '1', 'ALERT_SYNC_CONFIRM' => '1',
+    'ALERT_SYNC_WARNING' => '1',
     'ALERT_SCRUB_OK' => '0', 'ALERT_SCRUB_ISSUES' => '1',
     'ALERT_RECOVER_OK' => '0', 'ALERT_RECOVER_ERROR' => '1', 'ALERT_CANCELLED' => '0',
     'ALERT_PARITY_STALE' => '1', 'ALERT_DISK_OFFLINE' => '1',
@@ -295,6 +296,7 @@ foreach ($importCandidates as $c) { if (file_exists($c)) { $importDetected = $c;
       <div class="sre-checklist" id="sre-alert-toggles">
         <label><input type="checkbox" data-alert="ALERT_SYNC_OK"> Sync completed successfully</label>
         <label><input type="checkbox" data-alert="ALERT_SYNC_ERROR"> Sync failed or was aborted</label>
+        <label><input type="checkbox" data-alert="ALERT_SYNC_WARNING"> Sync completed but some files were being modified (not protected)</label>
         <label><input type="checkbox" data-alert="ALERT_SYNC_CONFIRM"> Sync paused for confirmation</label>
         <label><input type="checkbox" data-alert="ALERT_SCRUB_OK"> Scrub / full check completed with no problems</label>
         <label><input type="checkbox" data-alert="ALERT_SCRUB_ISSUES"> Scrub / full check found problems or failed</label>

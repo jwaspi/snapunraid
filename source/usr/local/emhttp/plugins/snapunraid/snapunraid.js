@@ -67,6 +67,8 @@
                 cls = 'error'; text = 'Attention needed';
             } else if (state.sync_status === 'needs_confirmation' || state.sync_status === 'running' || state.scrub_status === 'running') {
                 cls = 'warn'; text = 'In progress / needs review';
+            } else if (state.sync_status === 'warning') {
+                cls = 'warn'; text = 'Sync needs re-run';
             } else if (scrubOnlyMissing) {
                 cls = 'warn'; text = 'Sync needed';
             } else if (state.sync_status === 'cancelled' || state.scrub_status === 'cancelled') {
@@ -111,12 +113,19 @@
                 }
             }
 
-            document.getElementById('sre-sync-detail').textContent =
-                state.sync_status === 'running' ? ('Sync in progress...' + (state.sync_progress ? ` ${state.sync_progress}%` : '') + (state.sync_eta ? ` (ETA ${state.sync_eta})` : '')) :
-                (state.sync_status === 'cancelled' ? 'Sync cancelled' :
-                (state.sync_last_added !== undefined
-                    ? `${state.sync_last_added || 0} added, ${state.sync_last_removed || 0} removed, ${state.sync_last_updated || 0} updated`
-                    : 'No sync run yet'));
+            const syncCounts = `${state.sync_last_added || 0} added, ${state.sync_last_removed || 0} removed, ${state.sync_last_updated || 0} updated`;
+            const syncDetail = document.getElementById('sre-sync-detail');
+            if (state.sync_status === 'running') {
+                syncDetail.textContent = 'Sync in progress...' + (state.sync_progress ? ` ${state.sync_progress}%` : '') + (state.sync_eta ? ` (ETA ${state.sync_eta})` : '');
+            } else if (state.sync_status === 'cancelled') {
+                syncDetail.textContent = 'Sync cancelled';
+            } else if (state.sync_status === 'warning') {
+                syncDetail.textContent = syncCounts + ' - some files changed during the run and were not protected; re-run the sync.';
+            } else if (state.sync_last_added !== undefined) {
+                syncDetail.textContent = syncCounts;
+            } else {
+                syncDetail.textContent = 'No sync run yet';
+            }
 
             document.getElementById('sre-scrub-detail').textContent =
                 state.scrub_status === 'running' ? ('Scrub in progress...' + (state.scrub_progress ? ` ${state.scrub_progress}%` : '') + (state.scrub_eta ? ` (ETA ${state.scrub_eta})` : '')) :
@@ -154,12 +163,13 @@
 
             const logList = document.getElementById('sre-log-list');
             if (logList) {
+                const stText = { ok: 'OK', warning: 'warning', error: 'error', issues_found: 'issues found', cancelled: 'cancelled', needs_confirmation: 'needs review' };
                 const entries = [];
-                if (state.sync_finished) entries.push({ t: state.sync_finished, label: 'Sync', ok: state.sync_status === 'ok' });
-                if (state.scrub_finished) entries.push({ t: state.scrub_finished, label: 'Scrub', ok: state.scrub_status === 'ok' });
+                if (state.sync_finished) entries.push({ t: state.sync_finished, label: 'Sync', st: state.sync_status });
+                if (state.scrub_finished) entries.push({ t: state.scrub_finished, label: 'Scrub', st: state.scrub_status });
                 entries.sort((a, b) => b.t - a.t);
                 logList.innerHTML = entries.length ? entries.map(e =>
-                    `<div class="sre-log-entry"><span>${e.label} - ${e.ok ? 'OK' : 'see status above'}</span><span class="sre-log-time">${timeAgo(e.t)}</span></div>`
+                    `<div class="sre-log-entry"><span>${e.label} - ${stText[e.st] || e.st || 'see status above'}</span><span class="sre-log-time">${timeAgo(e.t)}</span></div>`
                 ).join('') : 'No activity yet.';
             }
         });
@@ -257,7 +267,7 @@
                 list.innerHTML = '<span style="opacity:.6">No runs yet. A Sync or Scrub will appear here when completed.</span>';
                 return;
             }
-            const statusText = { ok: 'OK', error: 'Error', paused: 'Paused', issues: 'Issues found', cancelled: 'Cancelled' };
+            const statusText = { ok: 'OK', error: 'Error', paused: 'Paused', issues: 'Issues found', cancelled: 'Cancelled', warning: 'Warning' };
             const esc = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
             list.innerHTML = '<table class="sre-history-table"><thead><tr><th>Type</th><th>Result</th><th>Details</th><th>When</th></tr></thead><tbody>' +
                 rows.map(r => {
@@ -270,7 +280,7 @@
                             detail = [r.added ? r.added + ' added' : '', r.removed ? r.removed + ' removed' : '', r.updated ? r.updated + ' updated' : ''].filter(Boolean).join(', ') || 'no changes';
                         }
                     }
-                    const cls = (r.status === 'error' || r.status === 'issues') ? 'sre-hist-bad' : (r.status === 'paused' || r.status === 'cancelled') ? 'sre-hist-warn' : 'sre-hist-ok';
+                    const cls = (r.status === 'error' || r.status === 'issues') ? 'sre-hist-bad' : (r.status === 'paused' || r.status === 'cancelled' || r.status === 'warning') ? 'sre-hist-warn' : 'sre-hist-ok';
                     const type = r.type === 'scrub' ? 'Scrub' : 'Sync';
                     const logAttr = r.log ? ' data-log="' + esc(r.log) + '"' : '';
                     return '<tr class="sre-hist-row ' + cls + '"' + logAttr + '><td>' + type + '</td><td>' + (statusText[r.status] || r.status) + '</td><td>' + esc(detail) + '</td><td>' + dt.toLocaleString() + '</td></tr>';
@@ -863,31 +873,37 @@
             // directory." were deleted or renamed since the last sync - that
             // is not damage, and restoring would undo the deletion. A sync
             // clears them from parity.
-            const real = problems.filter(p => p.reason !== 'missing');
-            const missing = problems.filter(p => p.reason === 'missing');
+            // "missing" (deleted/renamed since the last sync) and "modified"
+            // (changed while a run was reading it - SnapRAID's "Unexpected
+            // attribute change") are NOT damage: the remedy is a Sync, not a
+            // restore, so neither is ever offered for restore.
+            const benign = p => p.reason === 'missing' || p.reason === 'modified';
+            const benignLabel = p => p.reason === 'missing' ? 'deleted since last sync' : 'changed while the last run was running';
+            const real = problems.filter(p => !benign(p));
+            const pending = problems.filter(benign);
             if (real.length === 0) {
                 // Nothing actually damaged: explain, and hide every restore
                 // control so deleted files can't be brought back by accident.
                 if (summaryEl) {
                     summaryEl.style.display = 'block';
-                    summaryEl.textContent = `All ${missing.length} listed file(s) were deleted or renamed since the last sync - this is not damage. Run a Sync to clear them from parity; restoring would bring them back.`;
+                    summaryEl.textContent = `All ${pending.length} listed file(s) were deleted, renamed, or changed while a run was in progress - this is not damage. Run a Sync to bring parity up to date; restoring would bring deleted files back.`;
                 }
                 fixAllBtn.style.display = 'none';
-                list.innerHTML = missing.map(p =>
+                list.innerHTML = pending.map(p =>
                     `<div class="sre-problem-item">
-                        <span>${esc(p.path)} <span style="opacity:.6">(${esc(p.disk)}, deleted since last sync)</span></span>
+                        <span>${esc(p.path)} <span style="opacity:.6">(${esc(p.disk)}, ${benignLabel(p)})</span></span>
                         <span style="opacity:.7;font-size:12px;white-space:nowrap">no restore needed</span>
                      </div>`
                 ).join('');
                 return;
             }
-            fixAllBtn.style.display = missing.length ? 'none' : 'inline-block';
+            fixAllBtn.style.display = pending.length ? 'none' : 'inline-block';
             const totalSize = real.reduce((s, p) => s + (p.size || 0), 0);
             const unrecoverable = real.filter(p => p.reason === 'unrecoverable').length;
             if (summaryEl) {
                 summaryEl.style.display = 'block';
                 summaryEl.textContent = `${real.length} damaged file(s)${unrecoverable ? `, ${unrecoverable} unrecoverable` : ''} - ~${humanBytes(totalSize)} to restore.` +
-                    (missing.length ? ` Another ${missing.length} file(s) were deleted or renamed since the last sync - not damage; run a Sync to clear them.` : '');
+                    (pending.length ? ` Another ${pending.length} file(s) were deleted, renamed, or changed during a run - not damage; run a Sync.` : '');
             }
             // Per-disk restore: snapraid can rebuild everything on one disk
             // with `fix -d <label>`, which is more reliable than filtering
@@ -898,10 +914,10 @@
                     `<button class="sre-btn sre-btn-warn sre-fix-disk" data-disk="${esc(d)}">Restore all on ${esc(d)}</button>`
                   ).join('') + '</div>'
                 : '';
-            list.innerHTML = diskBtns + [...real, ...missing].map(p => {
-                if (p.reason === 'missing') {
+            list.innerHTML = diskBtns + [...real, ...pending].map(p => {
+                if (benign(p)) {
                     return `<div class="sre-problem-item">
-                        <span>${esc(p.path)} <span style="opacity:.6">(${esc(p.disk)}, deleted since last sync)</span></span>
+                        <span>${esc(p.path)} <span style="opacity:.6">(${esc(p.disk)}, ${benignLabel(p)})</span></span>
                         <span style="opacity:.7;font-size:12px;white-space:nowrap">no restore needed</span>
                      </div>`;
                 }

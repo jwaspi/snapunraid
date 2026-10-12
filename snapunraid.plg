@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "snapunraid">
   <!ENTITY author    "jwaspi">
-  <!ENTITY version   "2026.10.09">
+  <!ENTITY version   "2026.10.12a">
   <!ENTITY launch    "Settings/snapunraid">
   <!ENTITY pluginURL "https://raw.githubusercontent.com/jwaspi/snapunraid/main/snapunraid.plg">
   <!ENTITY support   "https://github.com/jwaspi/snapunraid/issues">
@@ -10,6 +10,8 @@
 <PLUGIN name="snapunraid" version="&version;" author="&author;" icon="camera"
         pluginURL="&pluginURL;" support="&support;" launch="&launch;">
   <CHANGES><![CDATA[
+2026.10.12a - FIX: a sync that hits SnapRAID soft errors for files changed mid-run now recognises every message variant ("Unexpected attribute/size/time/inode change"), not just the attribute wording, so those files are no longer listed as damage to restore; a genuine "Unexpected data change" is still damage, with its message stripped from the path. The warning's file count no longer reads 0 for the other variants. Error summaries are parsed in a single pass and the problem-file parser dedups in-process, removing redundant full-file scans of large logs.
+2026.10.12 - Sync warnings: files changed while a sync is reading them ("Unexpected attribute change", "You cannot modify files while running") are no longer reported as a failed sync or listed as damaged files to restore. A sync that hits only these soft errors now finishes as a warning ("Sync needs re-run"), its notification reports the affected file count instead of error blocks, and the Recover tab treats them as "no restore needed - run a Sync", like deleted files. New "Sync completed with warnings" alert toggle.
 2026.10.09 - FIX: after a reboot the Dashboard reported "Last sync: never", "No sync/scrub run yet" and "No activity yet" even though the History tab still listed past runs. The runtime state lives in a tmpfs file wiped on reboot; the Dashboard's last-run summary is now rebuilt from the persistent history on first load.
 2026.10.06 - SnapRAID updates: the Setup tab now shows the installed and latest SnapRAID versions and offers an Update button when a newer release is available (checked against GitHub, cached 6h). Fresh installs bootstrap to the latest release; a pinned version is used only if GitHub is unreachable.
 2026.10.05 - FIX: "Scrub is overdue" no longer false-alarms on a healthy, recently-scrubbed array. It now warns only when no scrub has completed within the threshold, not when a single block's age (scrub_oldest_days) exceeds it.
@@ -90,6 +92,7 @@ $cur_custom_scrub = sre_ini_get('CUSTOM_SCRUB_CRON', '0 4 * * 0');
 $cur_threshold= sre_ini_get('DELETE_THRESHOLD_COUNT', '50');
 $alertDefaults = [
     'ALERT_SYNC_OK' => '0', 'ALERT_SYNC_ERROR' => '1', 'ALERT_SYNC_CONFIRM' => '1',
+    'ALERT_SYNC_WARNING' => '1',
     'ALERT_SCRUB_OK' => '0', 'ALERT_SCRUB_ISSUES' => '1',
     'ALERT_RECOVER_OK' => '0', 'ALERT_RECOVER_ERROR' => '1', 'ALERT_CANCELLED' => '0',
     'ALERT_PARITY_STALE' => '1', 'ALERT_DISK_OFFLINE' => '1',
@@ -342,6 +345,7 @@ foreach ($importCandidates as $c) { if (file_exists($c)) { $importDetected = $c;
       <div class="sre-checklist" id="sre-alert-toggles">
         <label><input type="checkbox" data-alert="ALERT_SYNC_OK"> Sync completed successfully</label>
         <label><input type="checkbox" data-alert="ALERT_SYNC_ERROR"> Sync failed or was aborted</label>
+        <label><input type="checkbox" data-alert="ALERT_SYNC_WARNING"> Sync completed but some files were being modified (not protected)</label>
         <label><input type="checkbox" data-alert="ALERT_SYNC_CONFIRM"> Sync paused for confirmation</label>
         <label><input type="checkbox" data-alert="ALERT_SCRUB_OK"> Scrub / full check completed with no problems</label>
         <label><input type="checkbox" data-alert="ALERT_SCRUB_ISSUES"> Scrub / full check found problems or failed</label>
@@ -650,6 +654,8 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
                 cls = 'error'; text = 'Attention needed';
             } else if (state.sync_status === 'needs_confirmation' || state.sync_status === 'running' || state.scrub_status === 'running') {
                 cls = 'warn'; text = 'In progress / needs review';
+            } else if (state.sync_status === 'warning') {
+                cls = 'warn'; text = 'Sync needs re-run';
             } else if (scrubOnlyMissing) {
                 cls = 'warn'; text = 'Sync needed';
             } else if (state.sync_status === 'cancelled' || state.scrub_status === 'cancelled') {
@@ -694,12 +700,19 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
                 }
             }
 
-            document.getElementById('sre-sync-detail').textContent =
-                state.sync_status === 'running' ? ('Sync in progress...' + (state.sync_progress ? ` ${state.sync_progress}%` : '') + (state.sync_eta ? ` (ETA ${state.sync_eta})` : '')) :
-                (state.sync_status === 'cancelled' ? 'Sync cancelled' :
-                (state.sync_last_added !== undefined
-                    ? `${state.sync_last_added || 0} added, ${state.sync_last_removed || 0} removed, ${state.sync_last_updated || 0} updated`
-                    : 'No sync run yet'));
+            const syncCounts = `${state.sync_last_added || 0} added, ${state.sync_last_removed || 0} removed, ${state.sync_last_updated || 0} updated`;
+            const syncDetail = document.getElementById('sre-sync-detail');
+            if (state.sync_status === 'running') {
+                syncDetail.textContent = 'Sync in progress...' + (state.sync_progress ? ` ${state.sync_progress}%` : '') + (state.sync_eta ? ` (ETA ${state.sync_eta})` : '');
+            } else if (state.sync_status === 'cancelled') {
+                syncDetail.textContent = 'Sync cancelled';
+            } else if (state.sync_status === 'warning') {
+                syncDetail.textContent = syncCounts + ' - some files changed during the run and were not protected; re-run the sync.';
+            } else if (state.sync_last_added !== undefined) {
+                syncDetail.textContent = syncCounts;
+            } else {
+                syncDetail.textContent = 'No sync run yet';
+            }
 
             document.getElementById('sre-scrub-detail').textContent =
                 state.scrub_status === 'running' ? ('Scrub in progress...' + (state.scrub_progress ? ` ${state.scrub_progress}%` : '') + (state.scrub_eta ? ` (ETA ${state.scrub_eta})` : '')) :
@@ -737,12 +750,13 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
 
             const logList = document.getElementById('sre-log-list');
             if (logList) {
+                const stText = { ok: 'OK', warning: 'warning', error: 'error', issues_found: 'issues found', cancelled: 'cancelled', needs_confirmation: 'needs review' };
                 const entries = [];
-                if (state.sync_finished) entries.push({ t: state.sync_finished, label: 'Sync', ok: state.sync_status === 'ok' });
-                if (state.scrub_finished) entries.push({ t: state.scrub_finished, label: 'Scrub', ok: state.scrub_status === 'ok' });
+                if (state.sync_finished) entries.push({ t: state.sync_finished, label: 'Sync', st: state.sync_status });
+                if (state.scrub_finished) entries.push({ t: state.scrub_finished, label: 'Scrub', st: state.scrub_status });
                 entries.sort((a, b) => b.t - a.t);
                 logList.innerHTML = entries.length ? entries.map(e =>
-                    `<div class="sre-log-entry"><span>${e.label} - ${e.ok ? 'OK' : 'see status above'}</span><span class="sre-log-time">${timeAgo(e.t)}</span></div>`
+                    `<div class="sre-log-entry"><span>${e.label} - ${stText[e.st] || e.st || 'see status above'}</span><span class="sre-log-time">${timeAgo(e.t)}</span></div>`
                 ).join('') : 'No activity yet.';
             }
         });
@@ -840,7 +854,7 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
                 list.innerHTML = '<span style="opacity:.6">No runs yet. A Sync or Scrub will appear here when completed.</span>';
                 return;
             }
-            const statusText = { ok: 'OK', error: 'Error', paused: 'Paused', issues: 'Issues found', cancelled: 'Cancelled' };
+            const statusText = { ok: 'OK', error: 'Error', paused: 'Paused', issues: 'Issues found', cancelled: 'Cancelled', warning: 'Warning' };
             const esc = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
             list.innerHTML = '<table class="sre-history-table"><thead><tr><th>Type</th><th>Result</th><th>Details</th><th>When</th></tr></thead><tbody>' +
                 rows.map(r => {
@@ -853,7 +867,7 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
                             detail = [r.added ? r.added + ' added' : '', r.removed ? r.removed + ' removed' : '', r.updated ? r.updated + ' updated' : ''].filter(Boolean).join(', ') || 'no changes';
                         }
                     }
-                    const cls = (r.status === 'error' || r.status === 'issues') ? 'sre-hist-bad' : (r.status === 'paused' || r.status === 'cancelled') ? 'sre-hist-warn' : 'sre-hist-ok';
+                    const cls = (r.status === 'error' || r.status === 'issues') ? 'sre-hist-bad' : (r.status === 'paused' || r.status === 'cancelled' || r.status === 'warning') ? 'sre-hist-warn' : 'sre-hist-ok';
                     const type = r.type === 'scrub' ? 'Scrub' : 'Sync';
                     const logAttr = r.log ? ' data-log="' + esc(r.log) + '"' : '';
                     return '<tr class="sre-hist-row ' + cls + '"' + logAttr + '><td>' + type + '</td><td>' + (statusText[r.status] || r.status) + '</td><td>' + esc(detail) + '</td><td>' + dt.toLocaleString() + '</td></tr>';
@@ -1446,31 +1460,37 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
             // directory." were deleted or renamed since the last sync - that
             // is not damage, and restoring would undo the deletion. A sync
             // clears them from parity.
-            const real = problems.filter(p => p.reason !== 'missing');
-            const missing = problems.filter(p => p.reason === 'missing');
+            // "missing" (deleted/renamed since the last sync) and "modified"
+            // (changed while a run was reading it - SnapRAID's "Unexpected
+            // attribute change") are NOT damage: the remedy is a Sync, not a
+            // restore, so neither is ever offered for restore.
+            const benign = p => p.reason === 'missing' || p.reason === 'modified';
+            const benignLabel = p => p.reason === 'missing' ? 'deleted since last sync' : 'changed while the last run was running';
+            const real = problems.filter(p => !benign(p));
+            const pending = problems.filter(benign);
             if (real.length === 0) {
                 // Nothing actually damaged: explain, and hide every restore
                 // control so deleted files can't be brought back by accident.
                 if (summaryEl) {
                     summaryEl.style.display = 'block';
-                    summaryEl.textContent = `All ${missing.length} listed file(s) were deleted or renamed since the last sync - this is not damage. Run a Sync to clear them from parity; restoring would bring them back.`;
+                    summaryEl.textContent = `All ${pending.length} listed file(s) were deleted, renamed, or changed while a run was in progress - this is not damage. Run a Sync to bring parity up to date; restoring would bring deleted files back.`;
                 }
                 fixAllBtn.style.display = 'none';
-                list.innerHTML = missing.map(p =>
+                list.innerHTML = pending.map(p =>
                     `<div class="sre-problem-item">
-                        <span>${esc(p.path)} <span style="opacity:.6">(${esc(p.disk)}, deleted since last sync)</span></span>
+                        <span>${esc(p.path)} <span style="opacity:.6">(${esc(p.disk)}, ${benignLabel(p)})</span></span>
                         <span style="opacity:.7;font-size:12px;white-space:nowrap">no restore needed</span>
                      </div>`
                 ).join('');
                 return;
             }
-            fixAllBtn.style.display = missing.length ? 'none' : 'inline-block';
+            fixAllBtn.style.display = pending.length ? 'none' : 'inline-block';
             const totalSize = real.reduce((s, p) => s + (p.size || 0), 0);
             const unrecoverable = real.filter(p => p.reason === 'unrecoverable').length;
             if (summaryEl) {
                 summaryEl.style.display = 'block';
                 summaryEl.textContent = `${real.length} damaged file(s)${unrecoverable ? `, ${unrecoverable} unrecoverable` : ''} - ~${humanBytes(totalSize)} to restore.` +
-                    (missing.length ? ` Another ${missing.length} file(s) were deleted or renamed since the last sync - not damage; run a Sync to clear them.` : '');
+                    (pending.length ? ` Another ${pending.length} file(s) were deleted, renamed, or changed during a run - not damage; run a Sync.` : '');
             }
             // Per-disk restore: snapraid can rebuild everything on one disk
             // with `fix -d <label>`, which is more reliable than filtering
@@ -1481,10 +1501,10 @@ const SRE_CUSTOM_EXCLUDES = <?= json_encode(implode("\n", array_diff(
                     `<button class="sre-btn sre-btn-warn sre-fix-disk" data-disk="${esc(d)}">Restore all on ${esc(d)}</button>`
                   ).join('') + '</div>'
                 : '';
-            list.innerHTML = diskBtns + [...real, ...missing].map(p => {
-                if (p.reason === 'missing') {
+            list.innerHTML = diskBtns + [...real, ...pending].map(p => {
+                if (benign(p)) {
                     return `<div class="sre-problem-item">
-                        <span>${esc(p.path)} <span style="opacity:.6">(${esc(p.disk)}, deleted since last sync)</span></span>
+                        <span>${esc(p.path)} <span style="opacity:.6">(${esc(p.disk)}, ${benignLabel(p)})</span></span>
                         <span style="opacity:.7;font-size:12px;white-space:nowrap">no restore needed</span>
                      </div>`;
                 }
@@ -1809,6 +1829,7 @@ switch ($action) {
         // settings.ini so the Setup keys are preserved.
         $toggles = [
             'ALERT_SYNC_OK' => '0', 'ALERT_SYNC_ERROR' => '1', 'ALERT_SYNC_CONFIRM' => '1',
+            'ALERT_SYNC_WARNING' => '1',
             'ALERT_SCRUB_OK' => '0', 'ALERT_SCRUB_ISSUES' => '1',
             'ALERT_RECOVER_OK' => '0', 'ALERT_RECOVER_ERROR' => '1', 'ALERT_CANCELLED' => '0',
             'ALERT_PARITY_STALE' => '1', 'ALERT_DISK_OFFLINE' => '1',
@@ -2552,26 +2573,36 @@ sre_poll_progress() {
 #   status:unrecoverable:<disk>:<sub>
 # and prints unique "disk\tpath\treason\tsize" rows (tab separated).
 #
-# Implemented as a single awk|sort pass, NOT per-line jq/shell: a scrub or
-# check that flags every block of many deleted files can emit 100k+ tag lines,
-# and spawning a process per line takes minutes. One awk pass plus one sort is
-# linear. The disk field is resolved to its mount path via sre_disk_mount
-# (labels like "d6" map to /mnt/disk4), and a path containing ':' is preserved
-# because awk only splits the leading fixed fields (the sub-path is the rest of
-# the line).
+# SnapRAID reports a file that changed while it was being read with several
+# messages - "Unexpected attribute/size/time/inode change" ("You cannot modify
+# files while running"). These are NOT damage: the file changed between the scan
+# and the read, so its blocks were simply left unsynced. They are reported with
+# reason "modified" (never "checksum mismatch") so the Recover tab treats them
+# like a deleted file - the remedy is a re-sync, not a restore. A genuine
+# "Unexpected data change" (the bytes changed, not just the metadata) is a real
+# data error and keeps reason "checksum mismatch".
+#
+# Implemented as a SINGLE awk pass, NOT per-line jq/shell: a scrub or check that
+# flags every block of many deleted files can emit 100k+ tag lines, and spawning
+# a process per line takes minutes. The per-file dedup is done in an associative
+# array inside the same pass (no external sort, which would spawn a process and
+# spill to disk on a huge log). The disk field is resolved to its mount path via
+# sre_disk_mount (labels like "d6" map to /mnt/disk4), and a path containing ':'
+# is preserved because awk only splits the leading fixed fields (the sub-path is
+# the rest of the line).
 #
 #   sre_parse_problem_tags <logfile>
 # ---------------------------------------------------------------------------
 sre_parse_problem_tags() {
     local logfile="$1"
     [[ -f "$logfile" ]] || return 0
-    # Collect unique disk|sub|reason triples first (sort -u collapses the many
-    # per-block repeats of the same file), then resolve each disk once. A cache
-    # keyed by disk avoids re-parsing snapraid.conf for every row.
     awk '
         BEGIN { FS = ":" }
-        function emit(disk, path, reason) {
+        function emit(disk, path, reason,   k) {
             if (disk == "" || path == "") return
+            # Dedup the many per-block repeats of the same file in-pass.
+            k = disk SUBSEP path SUBSEP reason
+            if (seen[k]++) return
             print disk "\t" path "\t" reason
         }
         $1 == "error" || $1 == "error_data" {
@@ -2581,13 +2612,15 @@ sre_parse_problem_tags() {
             if ($2 !~ /^[0-9]+$/) next
             reason = "checksum mismatch"
             if ($0 ~ /Open error\. No such file or directory\./) reason = "missing"
+            else if ($0 ~ /Unexpected (attribute|size|time|inode) change/) reason = "modified"
             # sub is everything after the disk field, minus the trailing
-            # " : <message>". Strip the message only when it is the known
-            # trailing text; otherwise keep the whole remainder.
+            # " : <message>". Strip every known trailing message so the path is
+            # never polluted, whatever the error kind.
             line = $0
             gsub(/^[^:]*:[0-9]+:[^:]*:/, "", line)          # drop tag:block:disk:
-            if (reason == "missing") gsub(/: Open error\. No such file or directory\.$/, "", line)
-            else gsub(/: (Data|Unrecoverable) error.*$/, "", line)
+            gsub(/: Open error\. No such file or directory\.$/, "", line)
+            gsub(/: Unexpected (attribute|size|time|inode|data) change.*$/, "", line)
+            gsub(/: (Data|Unrecoverable|Corrupted) (error|change).*$/, "", line)
             emit($3, line, reason)
             next
         }
@@ -2596,7 +2629,7 @@ sre_parse_problem_tags() {
             gsub(/^status:(recoverable|unrecoverable):[^:]*:/, "", line)
             emit($3, line, $2)
         }
-    ' "$logfile" | sort -u
+    ' "$logfile"
 }
 
 # Resolve "<disk>\t<sub>\t<reason>" rows into "<disk>\t<fullpath>\t<reason>\t<size>".
@@ -2799,6 +2832,52 @@ sre_log_error_count() {
     echo $(( ${soft:-0} + ${io:-0} + ${data:-0} ))
 }
 
+# ---------------------------------------------------------------------------
+# One-pass error breakdown for a run log: prints "<soft> <io> <data> <exit_tag>".
+#
+# The log can be hundreds of MB (a real sync produced 564 MB), so the fields
+# are extracted in a SINGLE awk pass rather than one full-file grep per field.
+# exit_tag is the last summary:exit: value (e.g. "warning"), or empty when the
+# log has no such tag.
+#
+#   sre_log_errors <logfile>
+# ---------------------------------------------------------------------------
+sre_log_errors() {
+    local logfile="$1"
+    awk '
+        { if (match($0, /summary:error_soft:[0-9]+/)) { v=substr($0,RSTART,RLENGTH); sub(/.*:/,"",v); s=v }
+          if (match($0, /summary:error_io:[0-9]+/))   { v=substr($0,RSTART,RLENGTH); sub(/.*:/,"",v); i=v }
+          if (match($0, /summary:error_data:[0-9]+/)) { v=substr($0,RSTART,RLENGTH); sub(/.*:/,"",v); d=v }
+          if (match($0, /summary:exit:[a-z]+/))        { v=substr($0,RSTART,RLENGTH); sub(/.*:/,"",v); x=v } }
+        END { print (s+0), (i+0), (d+0), x }
+    ' "$logfile" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Classify a snapraid run's outcome from its exit code and log summary.
+#
+#   ok       - exit 0
+#   warning  - non-zero but ONLY soft errors: files were modified while the run
+#              read them ("Unexpected attribute change" / "You cannot modify
+#              files while running"). SnapRAID still saves its state; the
+#              affected blocks are just left unsynced, so the remedy is a
+#              re-run, not an investigation. SnapRAID tags this exit
+#              "summary:exit:warning" in the log.
+#   error    - anything else (any I/O or data error, or a generic failure).
+#
+#   sre_run_outcome <exit_code> <soft> <io> <data> <exit_tag>
+# ---------------------------------------------------------------------------
+sre_run_outcome() {
+    local rc="$1" soft="${2:-0}" io="${3:-0}" data="${4:-0}" tag="$5"
+    [[ "${rc:-0}" -eq 0 ]] && { echo ok; return; }
+    [[ "$tag" == "warning" ]] && { echo warning; return; }
+    if [[ "$io" -eq 0 && "$data" -eq 0 && "$soft" -gt 0 ]]; then
+        echo warning
+        return
+    fi
+    echo error
+}
+
 sre_log_summary() {
     # sre_log_summary <logfile> <kind>  (kind = sync | scrub)
     local logfile="$1" kind="$2"
@@ -2934,6 +3013,7 @@ sre_notify() {
     # Map subject -> alert setting key. Defaults: problems ON, routine OFF.
     local key="" default="1"
     case "$subject" in
+        "Sync completed with warnings"*) key="ALERT_SYNC_WARNING" ;;
         "Sync completed"*)             key="ALERT_SYNC_OK"       default="0" ;;
         "Sync failed"*|"Sync aborted"*) key="ALERT_SYNC_ERROR"    ;;
         "Sync needs confirmation"*)     key="ALERT_SYNC_CONFIRM"  ;;
@@ -4598,30 +4678,65 @@ sre_prune_logs
 SUMMARY=$(sre_log_summary "$LOGFILE" "sync")
 DURATION=$(sre_duration "$(jq -r '.sync_started // 0' "$STATE_FILE" 2>/dev/null)")
 
-if [[ $SYNC_RC -eq 0 ]]; then
-    sre_write_state "sync_status" "ok" "sync_finished" "$(date +%s)" \
-        "sync_last_added" "$ADDED" "sync_last_removed" "$REMOVED" "sync_last_updated" "$UPDATED" \
-        "sync_last_log" "$LOGFILE" "sync_last_error" "" "sync_pid" "" "sync_progress" ""
-    sre_append_history "sync" "ok" "added" "$ADDED" "removed" "$REMOVED" "updated" "$UPDATED" "log" "$LOGFILE"
-    sre_notify "Sync completed" "${SUMMARY}${DURATION:+, took ${DURATION}}." "normal"
-    # A scrub that ONLY reported "file deleted since last sync" blocks is fully
-    # resolved by this sync (its issues were unsynced deletions, now synced).
-    # Clear the stale issues status so the Dashboard returns to "Protected"
-    # instead of staying on "Attention needed" until the next scrub. Real
-    # corruption (any non-missing error) is left untouched for re-scrubbing.
-    SCRUB_RESOLVED=$(jq -r 'if .scrub_status == "issues_found" \
+# A non-zero exit is not always a failure. SnapRAID exits non-zero (tagging the
+# log "summary:exit:warning") when it hit only SOFT errors, which is what
+# happens when files are modified while the sync reads them ("You cannot modify
+# files while running"). The run still saves its state and the affected blocks
+# are simply left unsynced, so this is a warning (remedy: re-run the sync), not
+# a hard failure. Classify it with the shared helper, reading the log once.
+read -r SOFT IOE DATAE EXIT_TAG <<< "$(sre_log_errors "$LOGFILE")"
+OUTCOME=$(sre_run_outcome "$SYNC_RC" "${SOFT:-0}" "${IOE:-0}" "${DATAE:-0}" "$EXIT_TAG")
+
+# A scrub that ONLY reported "file deleted since last sync" blocks is fully
+# resolved by this sync (its issues were unsynced deletions, now synced). Clear
+# the stale issues status so the Dashboard returns to "Protected" instead of
+# staying on "Attention needed" until the next scrub. Real corruption (any
+# non-missing error) is left untouched for re-scrubbing. Runs on both ok and
+# warning outcomes - the sync saved its state either way.
+sre_clear_resolved_scrub_issues() {
+    local resolved
+    resolved=$(jq -r 'if .scrub_status == "issues_found" \
         and ((.scrub_missing_files // 0 | tonumber) > 0) \
         and ((.scrub_missing_files // 0 | tonumber) == (.scrub_last_bad_files // 0 | tonumber)) \
         then 1 else 0 end' "$STATE_FILE" 2>/dev/null)
-    if [[ "$SCRUB_RESOLVED" == "1" ]]; then
+    if [[ "$resolved" == "1" ]]; then
         sre_write_state "scrub_status" "ok" "scrub_last_bad_files" "0" "scrub_missing_files" "0"
     fi
-else
-    sre_write_state "sync_status" "error" "sync_finished" "$(date +%s)" "sync_last_log" "$LOGFILE" \
-        "sync_last_error" "snapraid sync exited with code ${SYNC_RC}, see log" "sync_pid" "" "sync_progress" ""
-    sre_append_history "sync" "error" "message" "snapraid sync exited with code ${SYNC_RC}" "log" "$LOGFILE"
-    sre_notify "Sync failed" "snapraid sync exited with code ${SYNC_RC}. ${SUMMARY}${DURATION:+, took ${DURATION}}. Check the log in the plugin's Dashboard tab." "alert"
-fi
+}
+
+case "$OUTCOME" in
+    ok)
+        sre_write_state "sync_status" "ok" "sync_finished" "$(date +%s)" \
+            "sync_last_added" "$ADDED" "sync_last_removed" "$REMOVED" "sync_last_updated" "$UPDATED" \
+            "sync_last_log" "$LOGFILE" "sync_last_error" "" "sync_pid" "" "sync_progress" ""
+        sre_append_history "sync" "ok" "added" "$ADDED" "removed" "$REMOVED" "updated" "$UPDATED" "log" "$LOGFILE"
+        sre_notify "Sync completed" "${SUMMARY}${DURATION:+, took ${DURATION}}." "normal"
+        sre_clear_resolved_scrub_issues
+        ;;
+    warning)
+        # Report in FILES, not error blocks: SnapRAID counts blocks, and one
+        # changed file can span thousands of them (835k blocks == 244 files in
+        # a real incident). Count every soft-error row that is not "missing"
+        # (deleted): those are the changed-but-unsynced files. A sync resolves
+        # deleted rows itself. The parser dedups and strips the message in one
+        # pass.
+        UNSYNCED_FILES=$(sre_parse_problem_tags "$LOGFILE" | awk -F'\t' '$3 != "missing" {n++} END{print n+0}')
+        MSG="${UNSYNCED_FILES} file(s) changed while the sync was running and were not protected - re-run the sync when they are idle, or exclude their folder. All other files synced normally."
+        sre_write_state "sync_status" "warning" "sync_finished" "$(date +%s)" \
+            "sync_last_added" "$ADDED" "sync_last_removed" "$REMOVED" "sync_last_updated" "$UPDATED" \
+            "sync_last_log" "$LOGFILE" "sync_last_error" "" "sync_pid" "" "sync_progress" ""
+        sre_append_history "sync" "warning" "added" "$ADDED" "removed" "$REMOVED" "updated" "$UPDATED" \
+            "bad_files" "$UNSYNCED_FILES" "message" "$MSG" "log" "$LOGFILE"
+        sre_notify "Sync completed with warnings" "${MSG}${DURATION:+ (took ${DURATION})}" "warning"
+        sre_clear_resolved_scrub_issues
+        ;;
+    *)
+        sre_write_state "sync_status" "error" "sync_finished" "$(date +%s)" "sync_last_log" "$LOGFILE" \
+            "sync_last_error" "snapraid sync exited with code ${SYNC_RC}, see log" "sync_pid" "" "sync_progress" ""
+        sre_append_history "sync" "error" "message" "snapraid sync exited with code ${SYNC_RC}" "log" "$LOGFILE"
+        sre_notify "Sync failed" "snapraid sync exited with code ${SYNC_RC}. ${SUMMARY}${DURATION:+, took ${DURATION}}. Check the log in the plugin's Dashboard tab." "alert"
+        ;;
+esac
 
 exit $SYNC_RC
 ]]>

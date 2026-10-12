@@ -350,26 +350,36 @@ sre_poll_progress() {
 #   status:unrecoverable:<disk>:<sub>
 # and prints unique "disk\tpath\treason\tsize" rows (tab separated).
 #
-# Implemented as a single awk|sort pass, NOT per-line jq/shell: a scrub or
-# check that flags every block of many deleted files can emit 100k+ tag lines,
-# and spawning a process per line takes minutes. One awk pass plus one sort is
-# linear. The disk field is resolved to its mount path via sre_disk_mount
-# (labels like "d6" map to /mnt/disk4), and a path containing ':' is preserved
-# because awk only splits the leading fixed fields (the sub-path is the rest of
-# the line).
+# SnapRAID reports a file that changed while it was being read with several
+# messages - "Unexpected attribute/size/time/inode change" ("You cannot modify
+# files while running"). These are NOT damage: the file changed between the scan
+# and the read, so its blocks were simply left unsynced. They are reported with
+# reason "modified" (never "checksum mismatch") so the Recover tab treats them
+# like a deleted file - the remedy is a re-sync, not a restore. A genuine
+# "Unexpected data change" (the bytes changed, not just the metadata) is a real
+# data error and keeps reason "checksum mismatch".
+#
+# Implemented as a SINGLE awk pass, NOT per-line jq/shell: a scrub or check that
+# flags every block of many deleted files can emit 100k+ tag lines, and spawning
+# a process per line takes minutes. The per-file dedup is done in an associative
+# array inside the same pass (no external sort, which would spawn a process and
+# spill to disk on a huge log). The disk field is resolved to its mount path via
+# sre_disk_mount (labels like "d6" map to /mnt/disk4), and a path containing ':'
+# is preserved because awk only splits the leading fixed fields (the sub-path is
+# the rest of the line).
 #
 #   sre_parse_problem_tags <logfile>
 # ---------------------------------------------------------------------------
 sre_parse_problem_tags() {
     local logfile="$1"
     [[ -f "$logfile" ]] || return 0
-    # Collect unique disk|sub|reason triples first (sort -u collapses the many
-    # per-block repeats of the same file), then resolve each disk once. A cache
-    # keyed by disk avoids re-parsing snapraid.conf for every row.
     awk '
         BEGIN { FS = ":" }
-        function emit(disk, path, reason) {
+        function emit(disk, path, reason,   k) {
             if (disk == "" || path == "") return
+            # Dedup the many per-block repeats of the same file in-pass.
+            k = disk SUBSEP path SUBSEP reason
+            if (seen[k]++) return
             print disk "\t" path "\t" reason
         }
         $1 == "error" || $1 == "error_data" {
@@ -379,13 +389,15 @@ sre_parse_problem_tags() {
             if ($2 !~ /^[0-9]+$/) next
             reason = "checksum mismatch"
             if ($0 ~ /Open error\. No such file or directory\./) reason = "missing"
+            else if ($0 ~ /Unexpected (attribute|size|time|inode) change/) reason = "modified"
             # sub is everything after the disk field, minus the trailing
-            # " : <message>". Strip the message only when it is the known
-            # trailing text; otherwise keep the whole remainder.
+            # " : <message>". Strip every known trailing message so the path is
+            # never polluted, whatever the error kind.
             line = $0
             gsub(/^[^:]*:[0-9]+:[^:]*:/, "", line)          # drop tag:block:disk:
-            if (reason == "missing") gsub(/: Open error\. No such file or directory\.$/, "", line)
-            else gsub(/: (Data|Unrecoverable) error.*$/, "", line)
+            gsub(/: Open error\. No such file or directory\.$/, "", line)
+            gsub(/: Unexpected (attribute|size|time|inode|data) change.*$/, "", line)
+            gsub(/: (Data|Unrecoverable|Corrupted) (error|change).*$/, "", line)
             emit($3, line, reason)
             next
         }
@@ -394,7 +406,7 @@ sre_parse_problem_tags() {
             gsub(/^status:(recoverable|unrecoverable):[^:]*:/, "", line)
             emit($3, line, $2)
         }
-    ' "$logfile" | sort -u
+    ' "$logfile"
 }
 
 # Resolve "<disk>\t<sub>\t<reason>" rows into "<disk>\t<fullpath>\t<reason>\t<size>".
@@ -597,6 +609,52 @@ sre_log_error_count() {
     echo $(( ${soft:-0} + ${io:-0} + ${data:-0} ))
 }
 
+# ---------------------------------------------------------------------------
+# One-pass error breakdown for a run log: prints "<soft> <io> <data> <exit_tag>".
+#
+# The log can be hundreds of MB (a real sync produced 564 MB), so the fields
+# are extracted in a SINGLE awk pass rather than one full-file grep per field.
+# exit_tag is the last summary:exit: value (e.g. "warning"), or empty when the
+# log has no such tag.
+#
+#   sre_log_errors <logfile>
+# ---------------------------------------------------------------------------
+sre_log_errors() {
+    local logfile="$1"
+    awk '
+        { if (match($0, /summary:error_soft:[0-9]+/)) { v=substr($0,RSTART,RLENGTH); sub(/.*:/,"",v); s=v }
+          if (match($0, /summary:error_io:[0-9]+/))   { v=substr($0,RSTART,RLENGTH); sub(/.*:/,"",v); i=v }
+          if (match($0, /summary:error_data:[0-9]+/)) { v=substr($0,RSTART,RLENGTH); sub(/.*:/,"",v); d=v }
+          if (match($0, /summary:exit:[a-z]+/))        { v=substr($0,RSTART,RLENGTH); sub(/.*:/,"",v); x=v } }
+        END { print (s+0), (i+0), (d+0), x }
+    ' "$logfile" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Classify a snapraid run's outcome from its exit code and log summary.
+#
+#   ok       - exit 0
+#   warning  - non-zero but ONLY soft errors: files were modified while the run
+#              read them ("Unexpected attribute change" / "You cannot modify
+#              files while running"). SnapRAID still saves its state; the
+#              affected blocks are just left unsynced, so the remedy is a
+#              re-run, not an investigation. SnapRAID tags this exit
+#              "summary:exit:warning" in the log.
+#   error    - anything else (any I/O or data error, or a generic failure).
+#
+#   sre_run_outcome <exit_code> <soft> <io> <data> <exit_tag>
+# ---------------------------------------------------------------------------
+sre_run_outcome() {
+    local rc="$1" soft="${2:-0}" io="${3:-0}" data="${4:-0}" tag="$5"
+    [[ "${rc:-0}" -eq 0 ]] && { echo ok; return; }
+    [[ "$tag" == "warning" ]] && { echo warning; return; }
+    if [[ "$io" -eq 0 && "$data" -eq 0 && "$soft" -gt 0 ]]; then
+        echo warning
+        return
+    fi
+    echo error
+}
+
 sre_log_summary() {
     # sre_log_summary <logfile> <kind>  (kind = sync | scrub)
     local logfile="$1" kind="$2"
@@ -732,6 +790,7 @@ sre_notify() {
     # Map subject -> alert setting key. Defaults: problems ON, routine OFF.
     local key="" default="1"
     case "$subject" in
+        "Sync completed with warnings"*) key="ALERT_SYNC_WARNING" ;;
         "Sync completed"*)             key="ALERT_SYNC_OK"       default="0" ;;
         "Sync failed"*|"Sync aborted"*) key="ALERT_SYNC_ERROR"    ;;
         "Sync needs confirmation"*)     key="ALERT_SYNC_CONFIRM"  ;;
